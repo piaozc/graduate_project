@@ -1,0 +1,565 @@
+﻿   1: import argparse
+   2: import json
+   3: import math
+   4: import random
+   5: from dataclasses import dataclass
+   6: from pathlib import Path
+   7: from typing import Dict, List, Sequence, Tuple
+   8: 
+   9: import cv2
+  10: import mediapipe as mp
+  11: import numpy as np
+  12: import torch
+  13: import torch.nn as nn
+  14: import torch.nn.functional as F
+  15: from torch.utils.data import DataLoader, Dataset
+  16: from tqdm import tqdm
+  17: 
+  18: 
+  19: def seed_everything(seed: int) -> None:
+  20:     random.seed(seed)
+  21:     np.random.seed(seed)
+  22:     torch.manual_seed(seed)
+  23:     torch.cuda.manual_seed_all(seed)
+  24: 
+  25: 
+  26: @dataclass
+  27: class SampleMeta:
+  28:     image_path: str
+  29:     label: int
+  30:     class_name: str
+  31: 
+  32: 
+  33: def scan_lfw(root: Path, min_images_per_identity: int, max_classes: int, max_images_per_class: int) -> Tuple[List[SampleMeta], Dict[str, int]]:
+  34:     class_dirs = [d for d in root.iterdir() if d.is_dir()]
+  35:     class_dirs.sort(key=lambda x: x.name)
+  36: 
+  37:     selected = []
+  38:     for d in class_dirs:
+  39:         imgs = sorted([p for p in d.iterdir() if p.suffix.lower() in {".jpg", ".jpeg", ".png"}])
+  40:         if len(imgs) >= min_images_per_identity:
+  41:             selected.append((d.name, imgs))
+  42: 
+  43:     selected.sort(key=lambda x: len(x[1]), reverse=True)
+  44:     if max_classes > 0:
+  45:         selected = selected[:max_classes]
+  46: 
+  47:     class_to_idx = {name: i for i, (name, _) in enumerate(selected)}
+  48:     samples: List[SampleMeta] = []
+  49: 
+  50:     for class_name, imgs in selected:
+  51:         if max_images_per_class > 0:
+  52:             imgs = imgs[:max_images_per_class]
+  53:         for p in imgs:
+  54:             samples.append(SampleMeta(str(p), class_to_idx[class_name], class_name))
+  55: 
+  56:     return samples, class_to_idx
+  57: 
+  58: 
+  59: def split_by_identity(samples: Sequence[SampleMeta], train_ratio: float, val_ratio: float, seed: int) -> Tuple[List[SampleMeta], List[SampleMeta], List[SampleMeta]]:
+  60:     by_class: Dict[int, List[SampleMeta]] = {}
+  61:     for s in samples:
+  62:         by_class.setdefault(s.label, []).append(s)
+  63: 
+  64:     rng = random.Random(seed)
+  65:     train, val, test = [], [], []
+  66: 
+  67:     for _, arr in by_class.items():
+  68:         rng.shuffle(arr)
+  69:         n = len(arr)
+  70:         n_train = max(1, int(n * train_ratio))
+  71:         n_val = max(1, int(n * val_ratio))
+  72:         if n_train + n_val >= n:
+  73:             n_val = 1
+  74:             n_train = max(1, n - 2)
+  75:         n_test = n - n_train - n_val
+  76:         if n_test <= 0:
+  77:             n_test = 1
+  78:             if n_train > n_val:
+  79:                 n_train -= 1
+  80:             else:
+  81:                 n_val -= 1
+  82: 
+  83:         train.extend(arr[:n_train])
+  84:         val.extend(arr[n_train:n_train + n_val])
+  85:         test.extend(arr[n_train + n_val:])
+  86: 
+  87:     rng.shuffle(train)
+  88:     rng.shuffle(val)
+  89:     rng.shuffle(test)
+  90:     return train, val, test
+  91: 
+  92: 
+  93: class LandmarkExtractor:
+  94:     def __init__(self, num_nodes: int = 68):
+  95:         self.num_nodes = num_nodes
+  96:         self.use_face_mesh = False
+  97:         self.face_mesh = None
+  98: 
+  99:         if hasattr(mp, "solutions") and hasattr(mp.solutions, "face_mesh"):
+ 100:             self.face_mesh = mp.solutions.face_mesh.FaceMesh(
+ 101:                 static_image_mode=True,
+ 102:                 max_num_faces=1,
+ 103:                 refine_landmarks=False,
+ 104:                 min_detection_confidence=0.5,
+ 105:             )
+ 106:             self.landmark_indices = np.linspace(0, 467, num=num_nodes, dtype=np.int32)
+ 107:             self.use_face_mesh = True
+ 108:         else:
+ 109:             self.landmark_indices = np.arange(num_nodes, dtype=np.int32)
+ 110:             cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+ 111:             self.face_detector = cv2.CascadeClassifier(cascade_path)
+ 112:             self.template = self._build_template_points(num_nodes)
+ 113: 
+ 114:     @staticmethod
+ 115:     def _build_template_points(num_nodes: int) -> np.ndarray:
+ 116:         # Pseudo landmarks distributed on an ellipse + inner rings to keep graph topology stable.
+ 117:         pts = []
+ 118:         ring1 = max(8, num_nodes // 3)
+ 119:         ring2 = max(8, num_nodes // 3)
+ 120:         ring3 = max(4, num_nodes - ring1 - ring2)
+ 121: 
+ 122:         for i in range(ring1):
+ 123:             t = 2.0 * math.pi * i / ring1
+ 124:             pts.append((0.5 + 0.42 * math.cos(t), 0.5 + 0.54 * math.sin(t)))
+ 125:         for i in range(ring2):
+ 126:             t = 2.0 * math.pi * i / ring2
+ 127:             pts.append((0.5 + 0.30 * math.cos(t), 0.5 + 0.38 * math.sin(t)))
+ 128:         for i in range(ring3):
+ 129:             t = 2.0 * math.pi * i / ring3
+ 130:             pts.append((0.5 + 0.15 * math.cos(t), 0.5 + 0.20 * math.sin(t)))
+ 131: 
+ 132:         return np.array(pts[:num_nodes], dtype=np.float32)
+ 133: 
+ 134:     def extract(self, image_bgr: np.ndarray) -> np.ndarray:
+ 135:         if self.use_face_mesh and self.face_mesh is not None:
+ 136:             rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+ 137:             result = self.face_mesh.process(rgb)
+ 138:             if not result.multi_face_landmarks:
+ 139:                 return np.full((len(self.landmark_indices), 2), -1.0, dtype=np.float32)
+ 140: 
+ 141:             lm = result.multi_face_landmarks[0].landmark
+ 142:             coords = np.zeros((len(self.landmark_indices), 2), dtype=np.float32)
+ 143:             h, w = image_bgr.shape[:2]
+ 144: 
+ 145:             for i, idx in enumerate(self.landmark_indices):
+ 146:                 x = np.clip(lm[idx].x, 0.0, 1.0)
+ 147:                 y = np.clip(lm[idx].y, 0.0, 1.0)
+ 148:                 coords[i, 0] = x * (w - 1)
+ 149:                 coords[i, 1] = y * (h - 1)
+ 150:             return coords
+ 151: 
+ 152:         gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+ 153:         faces = self.face_detector.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(32, 32))
+ 154:         if len(faces) == 0:
+ 155:             return np.full((self.num_nodes, 2), -1.0, dtype=np.float32)
+ 156: 
+ 157:         x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
+ 158:         coords = np.zeros((self.num_nodes, 2), dtype=np.float32)
+ 159:         coords[:, 0] = x + self.template[:, 0] * w
+ 160:         coords[:, 1] = y + self.template[:, 1] * h
+ 161:         return coords
+ 162: 
+ 163: 
+ 164: def build_knn_adjacency(coords_xy: np.ndarray, k: int) -> np.ndarray:
+ 165:     n = coords_xy.shape[0]
+ 166:     valid = np.where(coords_xy[:, 0] >= 0)[0]
+ 167:     adj = np.zeros((n, n), dtype=np.float32)
+ 168: 
+ 169:     if len(valid) <= 1:
+ 170:         np.fill_diagonal(adj, 1.0)
+ 171:         return adj
+ 172: 
+ 173:     pts = coords_xy[valid]
+ 174:     dist = np.sum((pts[:, None, :] - pts[None, :, :]) ** 2, axis=2)
+ 175:     for i in range(len(valid)):
+ 176:         nn_idx = np.argsort(dist[i])[1 : k + 1]
+ 177:         for j in nn_idx:
+ 178:             u = valid[i]
+ 179:             v = valid[j]
+ 180:             adj[u, v] = 1.0
+ 181:             adj[v, u] = 1.0
+ 182: 
+ 183:     np.fill_diagonal(adj, 1.0)
+ 184:     return adj
+ 185: 
+ 186: 
+ 187: def normalize_adjacency(adj: torch.Tensor) -> torch.Tensor:
+ 188:     deg = torch.sum(adj, dim=-1)
+ 189:     deg_inv_sqrt = torch.pow(deg.clamp(min=1.0), -0.5)
+ 190:     d = torch.diag_embed(deg_inv_sqrt)
+ 191:     return d @ adj @ d
+ 192: 
+ 193: 
+ 194: def make_node_features(image_bgr: np.ndarray, coords_xy: np.ndarray) -> np.ndarray:
+ 195:     h, w = image_bgr.shape[:2]
+ 196:     image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+ 197:     n = coords_xy.shape[0]
+ 198:     feat = np.zeros((n, 6), dtype=np.float32)  # x, y, r, g, b, occ_flag
+ 199: 
+ 200:     for i, (x, y) in enumerate(coords_xy):
+ 201:         if x < 0 or y < 0:
+ 202:             feat[i] = 0.0
+ 203:             feat[i, 5] = 1.0
+ 204:             continue
+ 205: 
+ 206:         xi = int(np.clip(round(x), 0, w - 1))
+ 207:         yi = int(np.clip(round(y), 0, h - 1))
+ 208:         rgb = image_rgb[yi, xi]
+ 209:         feat[i, 0] = x / max(w - 1, 1)
+ 210:         feat[i, 1] = y / max(h - 1, 1)
+ 211:         feat[i, 2:5] = rgb
+ 212:         feat[i, 5] = 0.0
+ 213: 
+ 214:     return feat
+ 215: 
+ 216: 
+ 217: def apply_random_occlusion(node_feat: np.ndarray, occlusion_prob: float) -> np.ndarray:
+ 218:     out = node_feat.copy()
+ 219:     if random.random() > occlusion_prob:
+ 220:         return out
+ 221: 
+ 222:     w = random.uniform(0.25, 0.45)
+ 223:     h = random.uniform(0.25, 0.45)
+ 224:     x0 = random.uniform(0.0, 1.0 - w)
+ 225:     y0 = random.uniform(0.0, 1.0 - h)
+ 226:     x1, y1 = x0 + w, y0 + h
+ 227: 
+ 228:     x = out[:, 0]
+ 229:     y = out[:, 1]
+ 230:     inside = (x >= x0) & (x <= x1) & (y >= y0) & (y <= y1)
+ 231: 
+ 232:     out[inside, 2:5] = 0.0
+ 233:     out[inside, 5] = 1.0
+ 234:     return out
+ 235: 
+ 236: 
+ 237: class LFWOccludedGraphDataset(Dataset):
+ 238:     def __init__(
+ 239:         self,
+ 240:         samples: Sequence[SampleMeta],
+ 241:         image_size: int,
+ 242:         num_nodes: int,
+ 243:         knn_k: int,
+ 244:         cache_path: Path,
+ 245:         train_mode: bool,
+ 246:         occlusion_prob: float,
+ 247:     ) -> None:
+ 248:         self.samples = list(samples)
+ 249:         self.image_size = image_size
+ 250:         self.num_nodes = num_nodes
+ 251:         self.knn_k = knn_k
+ 252:         self.train_mode = train_mode
+ 253:         self.occlusion_prob = occlusion_prob
+ 254:         self.cache_path = cache_path
+ 255:         self.extractor = LandmarkExtractor(num_nodes=num_nodes)
+ 256: 
+ 257:         self.cache: Dict[str, Dict[str, np.ndarray]] = {}
+ 258:         if cache_path.exists():
+ 259:             raw = np.load(str(cache_path), allow_pickle=True)
+ 260:             self.cache = raw["cache"].item()
+ 261: 
+ 262:         self._warm_cache_if_needed()
+ 263: 
+ 264:     def _warm_cache_if_needed(self) -> None:
+ 265:         updated = False
+ 266:         for s in tqdm(self.samples, desc="Caching landmarks", leave=False):
+ 267:             key = s.image_path
+ 268:             if key in self.cache:
+ 269:                 continue
+ 270: 
+ 271:             img = cv2.imread(s.image_path)
+ 272:             if img is None:
+ 273:                 continue
+ 274:             img = cv2.resize(img, (self.image_size, self.image_size))
+ 275:             coords = self.extractor.extract(img)
+ 276:             feat = make_node_features(img, coords)
+ 277:             adj = build_knn_adjacency(coords, self.knn_k)
+ 278:             self.cache[key] = {
+ 279:                 "node_feat": feat.astype(np.float32),
+ 280:                 "adj": adj.astype(np.float32),
+ 281:             }
+ 282:             updated = True
+ 283: 
+ 284:         if updated:
+ 285:             self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+ 286:             np.savez_compressed(str(self.cache_path), cache=self.cache)
+ 287: 
+ 288:     def __len__(self) -> int:
+ 289:         return len(self.samples)
+ 290: 
+ 291:     def __getitem__(self, idx: int):
+ 292:         s = self.samples[idx]
+ 293:         entry = self.cache.get(s.image_path)
+ 294:         if entry is None:
+ 295:             node_feat = np.zeros((self.num_nodes, 6), dtype=np.float32)
+ 296:             adj = np.eye(self.num_nodes, dtype=np.float32)
+ 297:         else:
+ 298:             node_feat = entry["node_feat"].copy()
+ 299:             adj = entry["adj"].copy()
+ 300: 
+ 301:         if self.train_mode:
+ 302:             node_feat = apply_random_occlusion(node_feat, self.occlusion_prob)
+ 303: 
+ 304:         return (
+ 305:             torch.from_numpy(node_feat),
+ 306:             torch.from_numpy(adj),
+ 307:             torch.tensor(s.label, dtype=torch.long),
+ 308:         )
+ 309: 
+ 310: 
+ 311: class GraphConv(nn.Module):
+ 312:     def __init__(self, in_dim: int, out_dim: int):
+ 313:         super().__init__()
+ 314:         self.linear = nn.Linear(in_dim, out_dim)
+ 315: 
+ 316:     def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
+ 317:         adj_norm = normalize_adjacency(adj)
+ 318:         h = self.linear(x)
+ 319:         return adj_norm @ h
+ 320: 
+ 321: 
+ 322: class NodeAttentionPool(nn.Module):
+ 323:     def __init__(self, in_dim: int, hidden: int = 64):
+ 324:         super().__init__()
+ 325:         self.scorer = nn.Sequential(
+ 326:             nn.Linear(in_dim, hidden),
+ 327:             nn.ReLU(inplace=True),
+ 328:             nn.Linear(hidden, 1),
+ 329:         )
+ 330: 
+ 331:     def forward(self, x: torch.Tensor) -> torch.Tensor:
+ 332:         score = self.scorer(x)  # [B, N, 1]
+ 333:         alpha = torch.softmax(score, dim=1)
+ 334:         out = torch.sum(alpha * x, dim=1)
+ 335:         return out
+ 336: 
+ 337: 
+ 338: class OccludedFaceGCN(nn.Module):
+ 339:     def __init__(self, in_dim: int, hidden_dim: int, num_classes: int, dropout: float):
+ 340:         super().__init__()
+ 341:         self.gcn1 = GraphConv(in_dim, hidden_dim)
+ 342:         self.gcn2 = GraphConv(hidden_dim, hidden_dim)
+ 343:         self.gcn3 = GraphConv(hidden_dim, hidden_dim)
+ 344:         self.dropout = nn.Dropout(dropout)
+ 345:         self.pool = NodeAttentionPool(hidden_dim)
+ 346:         self.head = nn.Linear(hidden_dim, num_classes)
+ 347: 
+ 348:     def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
+ 349:         x = F.relu(self.gcn1(x, adj))
+ 350:         x = self.dropout(x)
+ 351:         x = F.relu(self.gcn2(x, adj))
+ 352:         x = self.dropout(x)
+ 353:         x = F.relu(self.gcn3(x, adj))
+ 354:         g = self.pool(x)
+ 355:         return self.head(g)
+ 356: 
+ 357: 
+ 358: @torch.no_grad()
+ 359: def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> Tuple[float, float]:
+ 360:     model.eval()
+ 361:     total = 0
+ 362:     correct = 0
+ 363: 
+ 364:     all_pred = []
+ 365:     all_true = []
+ 366: 
+ 367:     for node_feat, adj, y in loader:
+ 368:         node_feat = node_feat.to(device)
+ 369:         adj = adj.to(device)
+ 370:         y = y.to(device)
+ 371:         logits = model(node_feat, adj)
+ 372:         pred = torch.argmax(logits, dim=1)
+ 373: 
+ 374:         total += y.size(0)
+ 375:         correct += (pred == y).sum().item()
+ 376:         all_pred.append(pred.cpu().numpy())
+ 377:         all_true.append(y.cpu().numpy())
+ 378: 
+ 379:     acc = correct / max(total, 1)
+ 380:     macro_f1 = macro_f1_score(np.concatenate(all_true), np.concatenate(all_pred))
+ 381:     return acc, macro_f1
+ 382: 
+ 383: 
+ 384: def macro_f1_score(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+ 385:     labels = np.unique(y_true)
+ 386:     f1_list = []
+ 387:     for c in labels:
+ 388:         tp = np.sum((y_true == c) & (y_pred == c))
+ 389:         fp = np.sum((y_true != c) & (y_pred == c))
+ 390:         fn = np.sum((y_true == c) & (y_pred != c))
+ 391: 
+ 392:         precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+ 393:         recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+ 394:         if precision + recall == 0:
+ 395:             f1 = 0.0
+ 396:         else:
+ 397:             f1 = 2 * precision * recall / (precision + recall)
+ 398:         f1_list.append(f1)
+ 399: 
+ 400:     return float(np.mean(f1_list)) if f1_list else 0.0
+ 401: 
+ 402: 
+ 403: def train_one_epoch(model: nn.Module, loader: DataLoader, optimizer, criterion, device: torch.device) -> float:
+ 404:     model.train()
+ 405:     running_loss = 0.0
+ 406: 
+ 407:     for node_feat, adj, y in tqdm(loader, desc="Train", leave=False):
+ 408:         node_feat = node_feat.to(device)
+ 409:         adj = adj.to(device)
+ 410:         y = y.to(device)
+ 411: 
+ 412:         optimizer.zero_grad()
+ 413:         logits = model(node_feat, adj)
+ 414:         loss = criterion(logits, y)
+ 415:         loss.backward()
+ 416:         optimizer.step()
+ 417: 
+ 418:         running_loss += loss.item() * y.size(0)
+ 419: 
+ 420:     return running_loss / max(len(loader.dataset), 1)
+ 421: 
+ 422: 
+ 423: def parse_args():
+ 424:     p = argparse.ArgumentParser(description="Occluded Face Recognition with GCN + Attention on LFW")
+ 425:     p.add_argument("--data-root", type=str, default="data/lfw-deepfunneled/lfw-deepfunneled")
+ 426:     p.add_argument("--save-dir", type=str, default="runs/occluded_gcn")
+ 427:     p.add_argument("--image-size", type=int, default=112)
+ 428:     p.add_argument("--num-nodes", type=int, default=68)
+ 429:     p.add_argument("--knn-k", type=int, default=6)
+ 430:     p.add_argument("--min-images-per-identity", type=int, default=10)
+ 431:     p.add_argument("--max-classes", type=int, default=200)
+ 432:     p.add_argument("--max-images-per-class", type=int, default=0)
+ 433:     p.add_argument("--train-ratio", type=float, default=0.7)
+ 434:     p.add_argument("--val-ratio", type=float, default=0.15)
+ 435:     p.add_argument("--occlusion-prob", type=float, default=0.7)
+ 436:     p.add_argument("--hidden-dim", type=int, default=128)
+ 437:     p.add_argument("--dropout", type=float, default=0.3)
+ 438:     p.add_argument("--batch-size", type=int, default=64)
+ 439:     p.add_argument("--epochs", type=int, default=20)
+ 440:     p.add_argument("--lr", type=float, default=1e-3)
+ 441:     p.add_argument("--weight-decay", type=float, default=1e-4)
+ 442:     p.add_argument("--num-workers", type=int, default=0)
+ 443:     p.add_argument("--seed", type=int, default=42)
+ 444:     return p.parse_args()
+ 445: 
+ 446: 
+ 447: def main():
+ 448:     args = parse_args()
+ 449:     seed_everything(args.seed)
+ 450: 
+ 451:     data_root = Path(args.data_root)
+ 452:     save_dir = Path(args.save_dir)
+ 453:     cache_path = save_dir / "landmark_cache.npz"
+ 454:     save_dir.mkdir(parents=True, exist_ok=True)
+ 455: 
+ 456:     if not data_root.exists():
+ 457:         raise FileNotFoundError(f"Data root not found: {data_root}")
+ 458: 
+ 459:     samples, class_to_idx = scan_lfw(
+ 460:         root=data_root,
+ 461:         min_images_per_identity=args.min_images_per_identity,
+ 462:         max_classes=args.max_classes,
+ 463:         max_images_per_class=args.max_images_per_class,
+ 464:     )
+ 465: 
+ 466:     if len(class_to_idx) < 2:
+ 467:         raise RuntimeError("Valid classes < 2. Lower --min-images-per-identity or check dataset path.")
+ 468: 
+ 469:     train_s, val_s, test_s = split_by_identity(samples, args.train_ratio, args.val_ratio, args.seed)
+ 470: 
+ 471:     train_ds = LFWOccludedGraphDataset(
+ 472:         samples=train_s,
+ 473:         image_size=args.image_size,
+ 474:         num_nodes=args.num_nodes,
+ 475:         knn_k=args.knn_k,
+ 476:         cache_path=cache_path,
+ 477:         train_mode=True,
+ 478:         occlusion_prob=args.occlusion_prob,
+ 479:     )
+ 480:     val_ds = LFWOccludedGraphDataset(
+ 481:         samples=val_s,
+ 482:         image_size=args.image_size,
+ 483:         num_nodes=args.num_nodes,
+ 484:         knn_k=args.knn_k,
+ 485:         cache_path=cache_path,
+ 486:         train_mode=False,
+ 487:         occlusion_prob=0.0,
+ 488:     )
+ 489:     test_ds = LFWOccludedGraphDataset(
+ 490:         samples=test_s,
+ 491:         image_size=args.image_size,
+ 492:         num_nodes=args.num_nodes,
+ 493:         knn_k=args.knn_k,
+ 494:         cache_path=cache_path,
+ 495:         train_mode=False,
+ 496:         occlusion_prob=0.0,
+ 497:     )
+ 498: 
+ 499:     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
+ 500:     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+ 501:     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+ 502: 
+ 503:     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+ 504:     model = OccludedFaceGCN(
+ 505:         in_dim=6,
+ 506:         hidden_dim=args.hidden_dim,
+ 507:         num_classes=len(class_to_idx),
+ 508:         dropout=args.dropout,
+ 509:     ).to(device)
+ 510: 
+ 511:     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+ 512:     criterion = nn.CrossEntropyLoss()
+ 513: 
+ 514:     best_val_acc = -1.0
+ 515:     history = []
+ 516: 
+ 517:     print(f"Device: {device}")
+ 518:     print(f"Classes: {len(class_to_idx)} | Train/Val/Test: {len(train_ds)}/{len(val_ds)}/{len(test_ds)}")
+ 519: 
+ 520:     for epoch in range(1, args.epochs + 1):
+ 521:         train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device)
+ 522:         val_acc, val_f1 = evaluate(model, val_loader, device)
+ 523: 
+ 524:         item = {
+ 525:             "epoch": epoch,
+ 526:             "train_loss": train_loss,
+ 527:             "val_acc": val_acc,
+ 528:             "val_macro_f1": val_f1,
+ 529:         }
+ 530:         history.append(item)
+ 531:         print(f"Epoch {epoch:03d} | loss={train_loss:.4f} | val_acc={val_acc:.4f} | val_f1={val_f1:.4f}")
+ 532: 
+ 533:         if val_acc > best_val_acc:
+ 534:             best_val_acc = val_acc
+ 535:             torch.save(model.state_dict(), save_dir / "best_model.pt")
+ 536: 
+ 537:     model.load_state_dict(torch.load(save_dir / "best_model.pt", map_location=device))
+ 538:     test_acc, test_f1 = evaluate(model, test_loader, device)
+ 539:     print(f"[Best] test_acc={test_acc:.4f} | test_macro_f1={test_f1:.4f}")
+ 540: 
+ 541:     with open(save_dir / "class_to_idx.json", "w", encoding="utf-8") as f:
+ 542:         json.dump(class_to_idx, f, ensure_ascii=False, indent=2)
+ 543: 
+ 544:     with open(save_dir / "history.json", "w", encoding="utf-8") as f:
+ 545:         json.dump(history, f, ensure_ascii=False, indent=2)
+ 546: 
+ 547:     with open(save_dir / "summary.json", "w", encoding="utf-8") as f:
+ 548:         json.dump(
+ 549:             {
+ 550:                 "best_val_acc": best_val_acc,
+ 551:                 "test_acc": test_acc,
+ 552:                 "test_macro_f1": test_f1,
+ 553:                 "num_classes": len(class_to_idx),
+ 554:                 "train_size": len(train_ds),
+ 555:                 "val_size": len(val_ds),
+ 556:                 "test_size": len(test_ds),
+ 557:             },
+ 558:             f,
+ 559:             ensure_ascii=False,
+ 560:             indent=2,
+ 561:         )
+ 562: 
+ 563: 
+ 564: if __name__ == "__main__":
+ 565:     main()
