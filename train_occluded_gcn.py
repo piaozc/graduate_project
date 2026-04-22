@@ -1,9 +1,13 @@
 ﻿import argparse
 import json
+import os
 import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
+
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+os.environ.setdefault("GLOG_minloglevel", "2")
 
 import cv2
 import mediapipe as mp
@@ -11,11 +15,29 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset, Sampler
+from mediapipe.tasks.python.vision import FaceLandmarksConnections
+from torch.utils.data import DataLoader, Dataset, Sampler, WeightedRandomSampler
 from tqdm import tqdm
 
-NODE_FEAT_DIM = 10
-OCC_FLAG_INDEX = 9
+NODE_FEAT_DIM = 37
+GEOMETRY_START_INDEX = 2
+GEOMETRY_END_INDEX = 13
+APPEARANCE_START_INDEX = 13
+APPEARANCE_END_INDEX = 35
+VALID_FLAG_INDEX = 35
+OCC_FLAG_INDEX = 36
+TOPOLOGY_EDGE_WEIGHT = 1.0
+KNN_EDGE_WEIGHT = 0.35
+OCCLUDED_MESSAGE_SCALE = 0.2
+FACE_REGION_CONNECTIONS = {
+    "face_oval": "FACE_LANDMARKS_FACE_OVAL",
+    "left_eye": "FACE_LANDMARKS_LEFT_EYE",
+    "right_eye": "FACE_LANDMARKS_RIGHT_EYE",
+    "left_eyebrow": "FACE_LANDMARKS_LEFT_EYEBROW",
+    "right_eyebrow": "FACE_LANDMARKS_RIGHT_EYEBROW",
+    "lips": "FACE_LANDMARKS_LIPS",
+    "nose": "FACE_LANDMARKS_NOSE",
+}
 
 
 def seed_everything(seed: int) -> None:
@@ -138,13 +160,38 @@ class LandmarkExtractor:
         return np.full((self.num_nodes, 2), -1.0, dtype=np.float32)
 
 
-def build_knn_adjacency(coords_xy: np.ndarray, k: int) -> np.ndarray:
-    n = coords_xy.shape[0]
-    valid = np.where(coords_xy[:, 0] >= 0)[0]
-    adj = np.zeros((n, n), dtype=np.float32)
+def normalize_adjacency(adj: torch.Tensor) -> torch.Tensor:
+    deg = torch.sum(adj, dim=-1)
+    deg_inv_sqrt = torch.pow(deg.clamp(min=1.0), -0.5)
+    d = torch.diag_embed(deg_inv_sqrt)
+    return d @ adj @ d
 
-    if len(valid) <= 1:
-        np.fill_diagonal(adj, 1.0)
+
+def _connections_to_edges(connection_name: str, num_nodes: int) -> List[Tuple[int, int]]:
+    connections = getattr(FaceLandmarksConnections, connection_name)
+    edges = []
+    for conn in connections:
+        u, v = int(conn.start), int(conn.end)
+        if 0 <= u < num_nodes and 0 <= v < num_nodes:
+            edges.append((u, v))
+    return edges
+
+
+def build_topology_adjacency(num_nodes: int) -> np.ndarray:
+    adj = np.zeros((num_nodes, num_nodes), dtype=np.float32)
+    for u, v in _connections_to_edges("FACE_LANDMARKS_TESSELATION", num_nodes):
+        adj[u, v] = TOPOLOGY_EDGE_WEIGHT
+        adj[v, u] = TOPOLOGY_EDGE_WEIGHT
+    np.fill_diagonal(adj, 1.0)
+    return adj
+
+
+def build_face_graph_adjacency(coords_xy: np.ndarray, k: int) -> np.ndarray:
+    n = coords_xy.shape[0]
+    adj = build_topology_adjacency(n)
+    valid = np.where(coords_xy[:, 0] >= 0)[0]
+
+    if len(valid) <= 1 or k <= 0:
         return adj
 
     pts = coords_xy[valid]
@@ -154,18 +201,84 @@ def build_knn_adjacency(coords_xy: np.ndarray, k: int) -> np.ndarray:
         for j in nn_idx:
             u = valid[i]
             v = valid[j]
-            adj[u, v] = 1.0
-            adj[v, u] = 1.0
+            adj[u, v] = max(adj[u, v], KNN_EDGE_WEIGHT)
+            adj[v, u] = max(adj[v, u], KNN_EDGE_WEIGHT)
 
     np.fill_diagonal(adj, 1.0)
     return adj
 
 
-def normalize_adjacency(adj: torch.Tensor) -> torch.Tensor:
-    deg = torch.sum(adj, dim=-1)
-    deg_inv_sqrt = torch.pow(deg.clamp(min=1.0), -0.5)
-    d = torch.diag_embed(deg_inv_sqrt)
-    return d @ adj @ d
+def build_graph_adjacency(coords_xy: np.ndarray, k: int, graph_mode: str) -> np.ndarray:
+    n = coords_xy.shape[0]
+    if graph_mode == "self":
+        return np.eye(n, dtype=np.float32)
+    if graph_mode == "topology":
+        return build_topology_adjacency(n)
+    if graph_mode == "knn":
+        adj = np.zeros((n, n), dtype=np.float32)
+        valid = np.where(coords_xy[:, 0] >= 0)[0]
+        if len(valid) > 1 and k > 0:
+            pts = coords_xy[valid]
+            dist = np.sum((pts[:, None, :] - pts[None, :, :]) ** 2, axis=2)
+            for i in range(len(valid)):
+                nn_idx = np.argsort(dist[i])[1 : k + 1]
+                for j in nn_idx:
+                    u = valid[i]
+                    v = valid[j]
+                    adj[u, v] = 1.0
+                    adj[v, u] = 1.0
+        np.fill_diagonal(adj, 1.0)
+        return adj
+    if graph_mode == "topology_knn":
+        return build_face_graph_adjacency(coords_xy, k)
+    raise ValueError(f"Unsupported graph_mode: {graph_mode}")
+
+
+def build_region_masks(num_nodes: int) -> torch.Tensor:
+    masks = []
+    for connection_name in FACE_REGION_CONNECTIONS.values():
+        nodes = sorted({idx for edge in _connections_to_edges(connection_name, num_nodes) for idx in edge})
+        mask = torch.zeros(num_nodes, dtype=torch.bool)
+        if nodes:
+            mask[nodes] = True
+        masks.append(mask)
+
+    full_face = torch.ones(num_nodes, dtype=torch.bool)
+    masks.append(full_face)
+    return torch.stack(masks, dim=0)
+
+
+def normalize_masked_adjacency(adj: torch.Tensor, node_feat: torch.Tensor) -> torch.Tensor:
+    valid = node_feat[:, :, VALID_FLAG_INDEX:VALID_FLAG_INDEX + 1]
+    occ = node_feat[:, :, OCC_FLAG_INDEX:OCC_FLAG_INDEX + 1]
+    source_reliability = valid.transpose(1, 2) * (1.0 - occ.transpose(1, 2) * (1.0 - OCCLUDED_MESSAGE_SCALE))
+    target_valid = valid
+    masked_adj = adj * source_reliability * target_valid
+
+    eye = torch.eye(adj.size(-1), dtype=adj.dtype, device=adj.device).unsqueeze(0)
+    masked_adj = torch.maximum(masked_adj, eye)
+    return normalize_adjacency(masked_adj)
+
+
+def patch_entropy(patch_gray: np.ndarray, bins: int = 8) -> float:
+    hist, _ = np.histogram(patch_gray, bins=bins, range=(0.0, 1.0), density=False)
+    prob = hist.astype(np.float32) / max(float(np.sum(hist)), 1.0)
+    prob = prob[prob > 0]
+    return float(-np.sum(prob * np.log2(prob)) / np.log2(bins))
+
+
+def local_binary_pattern_stats(image_gray: np.ndarray, x: int, y: int) -> Tuple[float, float]:
+    h, w = image_gray.shape[:2]
+    center = image_gray[y, x]
+    offsets = [(-1, -1), (0, -1), (1, -1), (1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0)]
+    bits = []
+    for dx, dy in offsets:
+        xx = int(np.clip(x + dx, 0, w - 1))
+        yy = int(np.clip(y + dy, 0, h - 1))
+        bits.append(1.0 if image_gray[yy, xx] >= center else 0.0)
+
+    transitions = sum(1 for i in range(len(bits)) if bits[i] != bits[(i + 1) % len(bits)])
+    return float(np.mean(bits)), float(transitions / len(bits))
 
 
 def make_node_features(image_bgr: np.ndarray, coords_xy: np.ndarray, rgb_window_size: int) -> np.ndarray:
@@ -177,29 +290,79 @@ def make_node_features(image_bgr: np.ndarray, coords_xy: np.ndarray, rgb_window_
     grad_mag = np.sqrt(grad_x ** 2 + grad_y ** 2)
     n = coords_xy.shape[0]
     feat = np.zeros((n, NODE_FEAT_DIM), dtype=np.float32)
-    half_window = max(0, rgb_window_size // 2)
+    valid = (coords_xy[:, 0] >= 0) & (coords_xy[:, 1] >= 0)
+    if not np.any(valid):
+        return feat
 
-    for i, (x, y) in enumerate(coords_xy):
-        if x < 0 or y < 0:
+    x_norm = coords_xy[:, 0] / max(w - 1, 1)
+    y_norm = coords_xy[:, 1] / max(h - 1, 1)
+    center_x = float(np.mean(x_norm[valid]))
+    center_y = float(np.mean(y_norm[valid]))
+    min_x, max_x = float(np.min(x_norm[valid])), float(np.max(x_norm[valid]))
+    min_y, max_y = float(np.min(y_norm[valid])), float(np.max(y_norm[valid]))
+    bbox_w = max(max_x - min_x, 1e-6)
+    bbox_h = max(max_y - min_y, 1e-6)
+    face_scale = max(float(np.sqrt(bbox_w * bbox_h)), 1e-6)
+    rel_x = x_norm - center_x
+    rel_y = y_norm - center_y
+    radius = np.sqrt(rel_x ** 2 + rel_y ** 2)
+    angle = np.arctan2(rel_y, rel_x)
+    half_window = max(1, rgb_window_size // 2)
+    global_rgb_mean = np.mean(image_rgb, axis=(0, 1))
+    global_gray_mean = float(np.mean(image_gray))
+
+    for i in range(n):
+        if not valid[i]:
             feat[i] = 0.0
-            feat[i, OCC_FLAG_INDEX] = 0.0
             continue
 
-        xi = int(np.clip(round(x), 0, w - 1))
-        yi = int(np.clip(round(y), 0, h - 1))
+        xi = int(np.clip(round(coords_xy[i, 0]), 0, w - 1))
+        yi = int(np.clip(round(coords_xy[i, 1]), 0, h - 1))
         x0 = max(0, xi - half_window)
         x1 = min(w, xi + half_window + 1)
         y0 = max(0, yi - half_window)
         y1 = min(h, yi + half_window + 1)
         patch_rgb = image_rgb[y0:y1, x0:x1]
+        patch_gray = image_gray[y0:y1, x0:x1]
+        patch_grad = grad_mag[y0:y1, x0:x1]
+        center_gray = image_gray[yi, xi]
+        lbp_density, lbp_transition = local_binary_pattern_stats(image_gray, xi, yi)
+
+        feat[i, 0] = x_norm[i]
+        feat[i, 1] = y_norm[i]
+        feat[i, 2] = rel_x[i]
+        feat[i, 3] = rel_y[i]
+        feat[i, 4] = radius[i]
+        feat[i, 5] = np.sin(angle[i])
+        feat[i, 6] = np.cos(angle[i])
+        feat[i, 7] = (x_norm[i] - min_x) / bbox_w
+        feat[i, 8] = (y_norm[i] - min_y) / bbox_h
+        feat[i, 9] = rel_x[i] / face_scale
+        feat[i, 10] = rel_y[i] / face_scale
+        feat[i, 11] = np.sin(2.0 * np.pi * i / max(n, 1))
+        feat[i, 12] = np.cos(2.0 * np.pi * i / max(n, 1))
+
         mean_rgb = np.mean(patch_rgb, axis=(0, 1))
         std_rgb = np.std(patch_rgb, axis=(0, 1))
-        mean_grad = float(np.mean(grad_mag[y0:y1, x0:x1]))
-        feat[i, 0] = x / max(w - 1, 1)
-        feat[i, 1] = y / max(h - 1, 1)
-        feat[i, 2:5] = mean_rgb
-        feat[i, 5:8] = std_rgb
-        feat[i, 8] = mean_grad
+        mean_gray = float(np.mean(patch_gray))
+        std_gray = float(np.std(patch_gray))
+        feat[i, 13:16] = mean_rgb
+        feat[i, 16:19] = std_rgb
+        feat[i, 19] = mean_gray
+        feat[i, 20] = std_gray
+        feat[i, 21] = float(np.mean(patch_grad))
+        feat[i, 22] = float(np.std(patch_grad))
+        feat[i, 23] = float(np.mean(np.abs(patch_gray - center_gray)))
+        feat[i, 24] = center_gray
+        feat[i, 25:28] = mean_rgb - global_rgb_mean
+        feat[i, 28] = mean_gray - global_gray_mean
+        feat[i, 29] = center_gray - global_gray_mean
+        feat[i, 30] = lbp_density
+        feat[i, 31] = lbp_transition
+        feat[i, 32] = float(np.mean(np.abs(grad_x[y0:y1, x0:x1])))
+        feat[i, 33] = float(np.mean(np.abs(grad_y[y0:y1, x0:x1])))
+        feat[i, 34] = patch_entropy(patch_gray)
+        feat[i, VALID_FLAG_INDEX] = 1.0
         feat[i, OCC_FLAG_INDEX] = 0.0
 
     return feat
@@ -208,7 +371,7 @@ def make_node_features(image_bgr: np.ndarray, coords_xy: np.ndarray, rgb_window_
 def sample_occlusion_mask(node_feat: np.ndarray) -> np.ndarray:
     x = node_feat[:, 0]
     y = node_feat[:, 1]
-    valid = node_feat[:, OCC_FLAG_INDEX] < 0.5
+    valid = (node_feat[:, VALID_FLAG_INDEX] > 0.5) & (node_feat[:, OCC_FLAG_INDEX] < 0.5)
     mask = np.zeros(node_feat.shape[0], dtype=bool)
 
     if not np.any(valid):
@@ -249,8 +412,10 @@ def apply_random_occlusion(node_feat: np.ndarray, occlusion_prob: float) -> np.n
     if not np.any(inside):
         return out
 
-    # Suppress local appearance features while retaining geometric coordinates.
-    out[inside, 2:9] = 0.0
+    # Mask detailed geometry and local handcrafted appearance in occluded
+    # regions while keeping absolute node positions for graph propagation.
+    out[inside, GEOMETRY_START_INDEX:GEOMETRY_END_INDEX] = 0.0
+    out[inside, APPEARANCE_START_INDEX:APPEARANCE_END_INDEX] = 0.0
     out[inside, OCC_FLAG_INDEX] = 1.0
     return out
 
@@ -262,6 +427,7 @@ class LFWOccludedGraphDataset(Dataset):
         image_size: int,
         num_nodes: int,
         knn_k: int,
+        graph_mode: str,
         rgb_window_size: int,
         cache_path: Path,
         train_mode: bool,
@@ -271,6 +437,7 @@ class LFWOccludedGraphDataset(Dataset):
         self.image_size = image_size
         self.num_nodes = num_nodes
         self.knn_k = knn_k
+        self.graph_mode = graph_mode
         self.rgb_window_size = rgb_window_size
         self.train_mode = train_mode
         self.occlusion_prob = occlusion_prob
@@ -282,6 +449,12 @@ class LFWOccludedGraphDataset(Dataset):
         if cache_path.exists():
             raw = np.load(str(cache_path), allow_pickle=True)
             self.cache = raw["cache"].item()
+            self.cache = {
+                key: entry
+                for key, entry in self.cache.items()
+                if entry["node_feat"].shape == (self.num_nodes, NODE_FEAT_DIM)
+                and entry["adj"].shape == (self.num_nodes, self.num_nodes)
+            }
 
         self._warm_cache_if_needed()
 
@@ -304,7 +477,7 @@ class LFWOccludedGraphDataset(Dataset):
                 self.invalid_paths.add(key)
                 continue
             feat = make_node_features(img, coords, self.rgb_window_size)
-            adj = build_knn_adjacency(coords, self.knn_k)
+            adj = build_graph_adjacency(coords, self.knn_k, self.graph_mode)
             self.cache[key] = {
                 "node_feat": feat.astype(np.float32),
                 "adj": adj.astype(np.float32),
@@ -376,14 +549,60 @@ class BalancedIdentityBatchSampler(Sampler[List[int]]):
         return self.num_batches
 
 
-class GraphConv(nn.Module):
+def compute_class_weights(samples: Sequence[SampleMeta], num_classes: int) -> torch.Tensor:
+    counts = np.zeros(num_classes, dtype=np.float32)
+    for sample in samples:
+        counts[sample.label] += 1.0
+
+    counts = np.maximum(counts, 1.0)
+    weights = np.sum(counts) / (num_classes * counts)
+    weights = weights / np.mean(weights)
+    return torch.tensor(weights, dtype=torch.float32)
+
+
+def build_weighted_sampler(samples: Sequence[SampleMeta], num_classes: int) -> WeightedRandomSampler:
+    class_weights = compute_class_weights(samples, num_classes).numpy()
+    sample_weights = [float(class_weights[s.label]) for s in samples]
+    return WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
+
+
+class MaskedGraphAttentionConv(nn.Module):
+    def __init__(self, in_dim: int, out_dim: int):
+        super().__init__()
+        self.query = nn.Linear(in_dim, out_dim, bias=False)
+        self.key = nn.Linear(in_dim, out_dim, bias=False)
+        self.value = nn.Linear(in_dim, out_dim)
+        self.out = nn.Linear(out_dim, out_dim)
+        self.scale = out_dim ** -0.5
+
+    def forward(self, x: torch.Tensor, adj_norm: torch.Tensor) -> torch.Tensor:
+        q = self.query(x)
+        k = self.key(x)
+        v = self.value(x)
+        score = torch.matmul(q, k.transpose(1, 2)) * self.scale
+        score = score + torch.log(adj_norm.clamp(min=1e-6))
+        score = score.masked_fill(adj_norm <= 0, -1e4)
+        alpha = torch.softmax(score, dim=-1)
+        return self.out(alpha @ v)
+
+
+class DenseGraphConv(nn.Module):
     def __init__(self, in_dim: int, out_dim: int):
         super().__init__()
         self.linear = nn.Linear(in_dim, out_dim)
 
     def forward(self, x: torch.Tensor, adj_norm: torch.Tensor) -> torch.Tensor:
-        h = self.linear(x)
-        return adj_norm @ h
+        return adj_norm @ self.linear(x)
+
+
+class NodeWiseMLPConv(nn.Module):
+    def __init__(self, in_dim: int, out_dim: int):
+        super().__init__()
+        self.linear = nn.Linear(in_dim, out_dim)
+
+    def forward(self, x: torch.Tensor, adj_norm: torch.Tensor) -> torch.Tensor:
+        _ = adj_norm
+        return self.linear(x)
 
 
 class NodeEncoder(nn.Module):
@@ -402,9 +621,17 @@ class NodeEncoder(nn.Module):
 
 
 class ResidualGCNBlock(nn.Module):
-    def __init__(self, hidden_dim: int, dropout: float):
+    def __init__(self, hidden_dim: int, dropout: float, conv_mode: str, message_scale_init: float):
         super().__init__()
-        self.conv = GraphConv(hidden_dim, hidden_dim)
+        if conv_mode == "gat":
+            self.conv = MaskedGraphAttentionConv(hidden_dim, hidden_dim)
+        elif conv_mode == "gcn":
+            self.conv = DenseGraphConv(hidden_dim, hidden_dim)
+        elif conv_mode == "mlp":
+            self.conv = NodeWiseMLPConv(hidden_dim, hidden_dim)
+        else:
+            raise ValueError(f"Unsupported conv_mode: {conv_mode}")
+        self.message_scale = nn.Parameter(torch.tensor(float(message_scale_init)))
         self.norm = nn.LayerNorm(hidden_dim)
         self.dropout = nn.Dropout(dropout)
 
@@ -413,7 +640,8 @@ class ResidualGCNBlock(nn.Module):
         h = self.norm(h)
         h = F.relu(h)
         h = self.dropout(h)
-        return x + h
+        scale = torch.clamp(self.message_scale, min=0.0, max=1.0)
+        return x + scale * h
 
 
 class OcclusionAwareInputGate(nn.Module):
@@ -454,6 +682,61 @@ class OcclusionAwareNodeAttention(nn.Module):
         return out
 
 
+class RegionAttentionPool(nn.Module):
+    def __init__(self, in_dim: int, num_nodes: int, hidden: int = 64):
+        super().__init__()
+        self.node_scorer = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, 1),
+        )
+        self.region_scorer = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, 1),
+        )
+        self.register_buffer("region_masks", build_region_masks(num_nodes), persistent=False)
+
+    def forward(self, x: torch.Tensor, return_attention: bool = False):
+        score = self.node_scorer(x)
+        region_features = []
+        region_node_alphas = []
+
+        for region_mask in self.region_masks:
+            mask = region_mask.view(1, -1, 1)
+            masked_score = score.masked_fill(~mask, -1e4)
+            alpha = torch.softmax(masked_score, dim=1)
+            region_feat = torch.sum(alpha * x, dim=1)
+            region_features.append(region_feat)
+            region_node_alphas.append(alpha)
+
+        regions = torch.stack(region_features, dim=1)
+        region_score = self.region_scorer(regions)
+        region_alpha = torch.softmax(region_score, dim=1)
+        out = torch.sum(region_alpha * regions, dim=1)
+
+        if return_attention:
+            node_alpha = torch.zeros_like(score)
+            for idx, alpha in enumerate(region_node_alphas):
+                node_alpha = node_alpha + region_alpha[:, idx:idx + 1, :] * alpha
+            return out, node_alpha
+        return out
+
+
+class MeanPool(nn.Module):
+    def forward(self, x: torch.Tensor, return_attention: bool = False):
+        out = torch.mean(x, dim=1)
+        if return_attention:
+            alpha = torch.full(
+                (x.size(0), x.size(1), 1),
+                1.0 / max(x.size(1), 1),
+                dtype=x.dtype,
+                device=x.device,
+            )
+            return out, alpha
+        return out
+
+
 class NodeAttentionPool(nn.Module):
     def __init__(self, in_dim: int, hidden: int = 64):
         super().__init__()
@@ -464,7 +747,7 @@ class NodeAttentionPool(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, return_attention: bool = False):
-        score = self.scorer(x)  # [B, N, 1]
+        score = self.scorer(x)
         alpha = torch.softmax(score, dim=1)
         out = torch.sum(alpha * x, dim=1)
         if return_attention:
@@ -473,39 +756,81 @@ class NodeAttentionPool(nn.Module):
 
 
 class OccludedFaceGCN(nn.Module):
-    def __init__(self, in_dim: int, hidden_dim: int, num_classes: int, dropout: float):
+    def __init__(
+        self,
+        in_dim: int,
+        hidden_dim: int,
+        num_classes: int,
+        dropout: float,
+        num_nodes: int,
+        conv_mode: str,
+        pool_mode: str,
+        use_input_gate: bool,
+        use_node_attention: bool,
+        message_scale_init: float,
+        jk_mode: str,
+    ):
         super().__init__()
+        self.use_input_gate = use_input_gate
+        self.use_node_attention = use_node_attention
+        self.jk_mode = jk_mode
         self.encoder = NodeEncoder(in_dim, hidden_dim)
         self.input_gate = OcclusionAwareInputGate(hidden_dim)
-        self.gcn1 = ResidualGCNBlock(hidden_dim, dropout)
-        self.gcn2 = ResidualGCNBlock(hidden_dim, dropout)
-        self.gcn3 = ResidualGCNBlock(hidden_dim, dropout)
+        self.gcn1 = ResidualGCNBlock(hidden_dim, dropout, conv_mode, message_scale_init)
+        self.gcn2 = ResidualGCNBlock(hidden_dim, dropout, conv_mode, message_scale_init)
+        self.gcn3 = ResidualGCNBlock(hidden_dim, dropout, conv_mode, message_scale_init)
+        if jk_mode == "concat":
+            self.jk_fuse = nn.Sequential(
+                nn.Linear(hidden_dim * 4, hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.LayerNorm(hidden_dim),
+            )
+        elif jk_mode == "last":
+            self.jk_fuse = nn.Identity()
+        else:
+            raise ValueError(f"Unsupported jk_mode: {jk_mode}")
         self.node_attention = OcclusionAwareNodeAttention(hidden_dim)
-        self.pool = NodeAttentionPool(hidden_dim)
+        if pool_mode == "mean":
+            self.pool = MeanPool()
+        elif pool_mode == "node_attention":
+            self.pool = NodeAttentionPool(hidden_dim)
+        elif pool_mode == "region_attention":
+            self.pool = RegionAttentionPool(hidden_dim, num_nodes)
+        else:
+            raise ValueError(f"Unsupported pool_mode: {pool_mode}")
         self.head = nn.Linear(hidden_dim, num_classes)
         self.last_input_gate = None
         self.last_attention = None
         self.last_node_attention = None
 
     def forward(self, x: torch.Tensor, adj: torch.Tensor, return_attention: bool = False, return_features: bool = False):
-        # Normalize the graph once per forward pass to match the standard
-        # propagation rule H^(l+1)=sigma(A_hat H^(l) W^(l)).
         occ_flag = x[:, :, OCC_FLAG_INDEX:OCC_FLAG_INDEX + 1]
-        adj_norm = normalize_adjacency(adj)
+        adj_norm = normalize_masked_adjacency(adj, x)
 
         x = self.encoder(x)
-        if return_attention:
+        if self.use_input_gate and return_attention:
             x, input_alpha = self.input_gate(x, occ_flag, return_attention=True)
-        else:
+        elif self.use_input_gate:
             x = self.input_gate(x, occ_flag)
             input_alpha = None
-        x = self.gcn1(x, adj_norm)
-        x = self.gcn2(x, adj_norm)
-        x = self.gcn3(x, adj_norm)
-        if return_attention:
-            x, node_alpha = self.node_attention(x, occ_flag, return_attention=True)
         else:
+            input_alpha = None
+
+        x0 = x
+        x1 = self.gcn1(x0, adj_norm)
+        x2 = self.gcn2(x1, adj_norm)
+        x3 = self.gcn3(x2, adj_norm)
+        if self.jk_mode == "concat":
+            x = self.jk_fuse(torch.cat([x0, x1, x2, x3], dim=-1))
+        else:
+            x = x3
+
+        if self.use_node_attention and return_attention:
+            x, node_alpha = self.node_attention(x, occ_flag, return_attention=True)
+        elif self.use_node_attention:
             x = self.node_attention(x, occ_flag)
+            node_alpha = None
+        else:
             node_alpha = None
 
         if return_attention:
@@ -622,6 +947,31 @@ def evaluate(model: nn.Module, gallery_loader: DataLoader, probe_loader: DataLoa
     return acc, macro_f1
 
 
+@torch.no_grad()
+def evaluate_classifier(model: nn.Module, loader: DataLoader, device: torch.device) -> Tuple[float, float]:
+    model.eval()
+    total = 0
+    correct = 0
+    all_pred = []
+    all_true = []
+
+    for node_feat, adj, y in loader:
+        node_feat = node_feat.to(device)
+        adj = adj.to(device)
+        y = y.to(device)
+        logits = model(node_feat, adj)
+        pred = torch.argmax(logits, dim=1)
+
+        total += y.size(0)
+        correct += (pred == y).sum().item()
+        all_pred.append(pred.cpu().numpy())
+        all_true.append(y.cpu().numpy())
+
+    acc = correct / max(total, 1)
+    macro_f1 = macro_f1_score(np.concatenate(all_true), np.concatenate(all_pred))
+    return acc, macro_f1
+
+
 def macro_f1_score(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     labels = np.unique(y_true)
     f1_list = []
@@ -647,46 +997,68 @@ def train_one_epoch(
     optimizer,
     criterion,
     device: torch.device,
+    epoch: int,
+    warmup_epochs: int,
     occlusion_prob: float,
     metric_loss: str,
     metric_weight: float,
     triplet_margin: float,
     consistency_weight: float,
-) -> float:
+    grad_clip: float,
+) -> Tuple[float, float, float]:
     model.train()
     running_loss = 0.0
+    running_correct = 0
+    running_total = 0
+    if warmup_epochs > 0:
+        if epoch <= warmup_epochs:
+            schedule = 0.0
+        else:
+            schedule = min(1.0, (epoch - warmup_epochs) / max(warmup_epochs, 1))
+    else:
+        schedule = 1.0
+
+    effective_occlusion_prob = occlusion_prob * schedule
+    effective_metric_weight = metric_weight * schedule
+    effective_consistency_weight = consistency_weight * schedule
 
     for node_feat, adj, y in tqdm(loader, desc="Train", leave=False):
         clean_node_feat = node_feat.clone()
-        occ_node_feat = torch.stack(
-            [torch.from_numpy(apply_random_occlusion(sample.numpy(), occlusion_prob)) for sample in clean_node_feat],
-            dim=0,
-        )
 
         clean_node_feat = clean_node_feat.to(device)
-        occ_node_feat = occ_node_feat.to(device)
         adj = adj.to(device)
         y = y.to(device)
 
         optimizer.zero_grad()
         logits_clean, graph_feat_clean = model(clean_node_feat, adj, return_features=True)
-        logits_occ, graph_feat_occ = model(occ_node_feat, adj, return_features=True)
-        cls_loss = 0.5 * (criterion(logits_clean, y) + criterion(logits_occ, y))
-        cons_loss = occlusion_consistency_loss(graph_feat_clean, graph_feat_occ)
-        loss = cls_loss + consistency_weight * cons_loss
+        loss = criterion(logits_clean, y)
 
-        if metric_loss == "triplet":
-            pair_feat = torch.cat([graph_feat_clean, graph_feat_occ], dim=0)
-            pair_labels = torch.cat([y, y], dim=0)
-            tri_loss = batch_hard_triplet_loss(pair_feat, pair_labels, margin=triplet_margin)
-            loss = loss + metric_weight * tri_loss
+        if schedule > 0.0:
+            occ_node_feat = torch.stack(
+                [torch.from_numpy(apply_random_occlusion(sample.numpy(), effective_occlusion_prob)) for sample in node_feat],
+                dim=0,
+            ).to(device)
+            logits_occ, graph_feat_occ = model(occ_node_feat, adj, return_features=True)
+            cls_loss = 0.5 * (criterion(logits_clean, y) + criterion(logits_occ, y))
+            cons_loss = occlusion_consistency_loss(graph_feat_clean, graph_feat_occ)
+            loss = cls_loss + effective_consistency_weight * cons_loss
+
+            if metric_loss == "triplet" and effective_metric_weight > 0:
+                pair_feat = torch.cat([graph_feat_clean, graph_feat_occ], dim=0)
+                pair_labels = torch.cat([y, y], dim=0)
+                tri_loss = batch_hard_triplet_loss(pair_feat, pair_labels, margin=triplet_margin)
+                loss = loss + effective_metric_weight * tri_loss
 
         loss.backward()
+        if grad_clip > 0:
+            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
 
         running_loss += loss.item() * y.size(0)
+        running_correct += (torch.argmax(logits_clean, dim=1) == y).sum().item()
+        running_total += y.size(0)
 
-    return running_loss / max(len(loader.dataset), 1)
+    return running_loss / max(running_total, 1), running_correct / max(running_total, 1), schedule
 
 
 def parse_args():
@@ -696,7 +1068,14 @@ def parse_args():
     p.add_argument("--image-size", type=int, default=112)
     p.add_argument("--num-nodes", type=int, default=468)
     p.add_argument("--knn-k", type=int, default=6)
-    p.add_argument("--rgb-window-size", type=int, default=3)
+    p.add_argument("--graph-mode", type=str, default="topology_knn", choices=["self", "knn", "topology", "topology_knn"])
+    p.add_argument("--conv-mode", type=str, default="gat", choices=["mlp", "gcn", "gat"])
+    p.add_argument("--pool-mode", type=str, default="region_attention", choices=["mean", "node_attention", "region_attention"])
+    p.add_argument("--use-input-gate", action="store_true")
+    p.add_argument("--use-node-attention", action="store_true")
+    p.add_argument("--message-scale-init", type=float, default=0.1)
+    p.add_argument("--jk-mode", type=str, default="concat", choices=["last", "concat"])
+    p.add_argument("--rgb-window-size", type=int, default=7, help="Local window size for handcrafted node appearance descriptors.")
     p.add_argument("--min-images-per-identity", type=int, default=10)
     # Start with an easier closed-set setting to verify the model can learn
     # before scaling to larger class counts.
@@ -709,12 +1088,17 @@ def parse_args():
     p.add_argument("--dropout", type=float, default=0.3)
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--epochs", type=int, default=30)
+    p.add_argument("--warmup-epochs", type=int, default=5)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=1e-4)
+    p.add_argument("--label-smoothing", type=float, default=0.05)
+    p.add_argument("--balanced-sampling", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--class-weighting", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--metric-loss", type=str, default="triplet", choices=["none", "triplet"])
     p.add_argument("--metric-weight", type=float, default=0.2)
     p.add_argument("--triplet-margin", type=float, default=0.3)
     p.add_argument("--consistency-weight", type=float, default=0.5)
+    p.add_argument("--grad-clip", type=float, default=5.0)
     p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
@@ -726,7 +1110,10 @@ def main():
 
     data_root = Path(args.data_root)
     save_dir = Path(args.save_dir)
-    cache_path = save_dir / f"landmark_cache_{args.num_nodes}n_feat10_rgb{args.rgb_window_size}x{args.rgb_window_size}.npz"
+    cache_path = save_dir / (
+        f"landmark_cache_{args.num_nodes}n_feat{NODE_FEAT_DIM}_local{args.rgb_window_size}"
+        f"_{args.graph_mode}.npz"
+    )
     save_dir.mkdir(parents=True, exist_ok=True)
 
     if not data_root.exists():
@@ -749,6 +1136,7 @@ def main():
         image_size=args.image_size,
         num_nodes=args.num_nodes,
         knn_k=args.knn_k,
+        graph_mode=args.graph_mode,
         rgb_window_size=args.rgb_window_size,
         cache_path=cache_path,
         train_mode=True,
@@ -759,6 +1147,7 @@ def main():
         image_size=args.image_size,
         num_nodes=args.num_nodes,
         knn_k=args.knn_k,
+        graph_mode=args.graph_mode,
         rgb_window_size=args.rgb_window_size,
         cache_path=cache_path,
         train_mode=False,
@@ -769,6 +1158,7 @@ def main():
         image_size=args.image_size,
         num_nodes=args.num_nodes,
         knn_k=args.knn_k,
+        graph_mode=args.graph_mode,
         rgb_window_size=args.rgb_window_size,
         cache_path=cache_path,
         train_mode=False,
@@ -779,6 +1169,7 @@ def main():
         image_size=args.image_size,
         num_nodes=args.num_nodes,
         knn_k=args.knn_k,
+        graph_mode=args.graph_mode,
         rgb_window_size=args.rgb_window_size,
         cache_path=cache_path,
         train_mode=False,
@@ -788,6 +1179,9 @@ def main():
     if args.metric_loss != "none":
         train_sampler = BalancedIdentityBatchSampler(train_ds.samples, batch_size=args.batch_size, instances_per_identity=2)
         train_loader = DataLoader(train_ds, batch_sampler=train_sampler, num_workers=args.num_workers)
+    elif args.balanced_sampling:
+        train_sampler = build_weighted_sampler(train_ds.samples, len(class_to_idx))
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=train_sampler, num_workers=args.num_workers)
     else:
         train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
     train_eval_loader = DataLoader(train_eval_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
@@ -800,42 +1194,70 @@ def main():
         hidden_dim=args.hidden_dim,
         num_classes=len(class_to_idx),
         dropout=args.dropout,
+        num_nodes=args.num_nodes,
+        conv_mode=args.conv_mode,
+        pool_mode=args.pool_mode,
+        use_input_gate=args.use_input_gate,
+        use_node_attention=args.use_node_attention,
+        message_scale_init=args.message_scale_init,
+        jk_mode=args.jk_mode,
     ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    criterion = nn.CrossEntropyLoss()
+    class_weights = compute_class_weights(train_ds.samples, len(class_to_idx)).to(device) if args.class_weighting else None
+    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=args.label_smoothing)
 
     best_val_acc = -1.0
     history = []
 
     print(f"Device: {device}")
     print(f"Classes: {len(class_to_idx)} | Train/Val/Test: {len(train_ds)}/{len(val_ds)}/{len(test_ds)}")
+    print(
+        f"Ablation config: graph={args.graph_mode} | conv={args.conv_mode} | pool={args.pool_mode} "
+        f"| input_gate={args.use_input_gate} | node_attention={args.use_node_attention} "
+        f"| message_scale_init={args.message_scale_init} | jk={args.jk_mode}"
+    )
+    print(f"Class balance: weighted_loss={args.class_weighting} | balanced_sampling={args.balanced_sampling}")
     print("Evaluation mode: feature matching against train-set class prototypes")
-    print("Training mode: clean/occluded dual-view optimization with input gating, triplet loss, and consistency loss")
+    print("Input features: landmark geometry + handcrafted local appearance descriptors; no CNN branch")
+    print("Graph mode: MediaPipe topology + light KNN edges with occlusion-aware message passing")
+    print("Training mode: clean warmup, then masked graph attention + region attention with occlusion optimization")
 
     for epoch in range(1, args.epochs + 1):
-        train_loss = train_one_epoch(
+        train_loss, train_acc, occ_schedule = train_one_epoch(
             model,
             train_loader,
             optimizer,
             criterion,
             device,
+            epoch=epoch,
+            warmup_epochs=args.warmup_epochs,
             occlusion_prob=args.occlusion_prob,
             metric_loss=args.metric_loss,
             metric_weight=args.metric_weight,
             triplet_margin=args.triplet_margin,
             consistency_weight=args.consistency_weight,
+            grad_clip=args.grad_clip,
         )
         val_acc, val_f1 = evaluate(model, train_eval_loader, val_loader, device)
+        val_cls_acc, val_cls_f1 = evaluate_classifier(model, val_loader, device)
 
         item = {
             "epoch": epoch,
             "train_loss": train_loss,
+            "train_acc": train_acc,
+            "occlusion_schedule": occ_schedule,
             "val_acc": val_acc,
             "val_macro_f1": val_f1,
+            "val_cls_acc": val_cls_acc,
+            "val_cls_macro_f1": val_cls_f1,
         }
         history.append(item)
-        print(f"Epoch {epoch:03d} | loss={train_loss:.4f} | val_acc={val_acc:.4f} | val_f1={val_f1:.4f}")
+        print(
+            f"Epoch {epoch:03d} | loss={train_loss:.4f} | train_acc={train_acc:.4f} "
+            f"| occ={occ_schedule:.2f} | val_acc={val_acc:.4f} | val_f1={val_f1:.4f} "
+            f"| val_cls_acc={val_cls_acc:.4f}"
+        )
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
