@@ -38,6 +38,7 @@ FACE_REGION_CONNECTIONS = {
     "lips": "FACE_LANDMARKS_LIPS",
     "nose": "FACE_LANDMARKS_NOSE",
 }
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def seed_everything(seed: int) -> None:
@@ -120,7 +121,7 @@ class LandmarkExtractor:
         self.semantic_groups = self._build_semantic_groups(num_nodes)
         self.landmarker = None
 
-        model_path = Path(__file__).resolve().parent / "models" / "face_landmarker.task"
+        model_path = PROJECT_ROOT / "models" / "face_landmarker.task"
         if model_path.exists() and hasattr(mp, "tasks") and hasattr(mp.tasks, "vision"):
             base_options = mp.tasks.BaseOptions(model_asset_path=str(model_path))
             options = mp.tasks.vision.FaceLandmarkerOptions(
@@ -686,12 +687,12 @@ class RegionAttentionPool(nn.Module):
     def __init__(self, in_dim: int, num_nodes: int, hidden: int = 64):
         super().__init__()
         self.node_scorer = nn.Sequential(
-            nn.Linear(in_dim, hidden),
+            nn.Linear(in_dim + 2, hidden),
             nn.ReLU(inplace=True),
             nn.Linear(hidden, 1),
         )
         self.region_scorer = nn.Sequential(
-            nn.Linear(in_dim, hidden),
+            nn.Linear(in_dim + 2, hidden),
             nn.ReLU(inplace=True),
             nn.Linear(hidden, 1),
         )
@@ -704,24 +705,45 @@ class RegionAttentionPool(nn.Module):
         occ_flag: torch.Tensor | None = None,
         return_attention: bool = False,
     ):
-        score = self.node_scorer(x)
-        if valid_flag is not None:
-            score = score.masked_fill(valid_flag <= 0.5, -1e4)
-        if occ_flag is not None:
-            score = score - 2.0 * occ_flag
+        if valid_flag is None:
+            valid_flag = torch.ones_like(x[:, :, :1])
+        if occ_flag is None:
+            occ_flag = torch.zeros_like(x[:, :, :1])
+
+        node_score_input = torch.cat([x, valid_flag, occ_flag], dim=-1)
+        score = self.node_scorer(node_score_input)
+        score = score.masked_fill(valid_flag <= 0.5, -1e4)
+        score = score - 2.5 * occ_flag
         region_features = []
         region_node_alphas = []
+        region_valid_ratios = []
+        region_occ_ratios = []
 
         for region_mask in self.region_masks:
             mask = region_mask.view(1, -1, 1)
-            masked_score = score.masked_fill(~mask, -1e4)
+            region_valid = mask & (valid_flag > 0.5)
+            masked_score = score.masked_fill(~region_valid, -1e4)
             alpha = torch.softmax(masked_score, dim=1)
+            alpha = torch.where(region_valid, alpha, torch.zeros_like(alpha))
+            alpha = alpha / alpha.sum(dim=1, keepdim=True).clamp(min=1e-6)
             region_feat = torch.sum(alpha * x, dim=1)
             region_features.append(region_feat)
             region_node_alphas.append(alpha)
 
+            valid_count = region_valid.float().sum(dim=1).clamp(min=1.0)
+            region_size = mask.float().sum(dim=1).clamp(min=1.0)
+            region_valid_ratio = valid_count / region_size
+            region_occ_ratio = (occ_flag * region_valid.float()).sum(dim=1) / valid_count
+            region_valid_ratios.append(region_valid_ratio)
+            region_occ_ratios.append(region_occ_ratio)
+
         regions = torch.stack(region_features, dim=1)
-        region_score = self.region_scorer(regions)
+        region_valid_ratio = torch.stack(region_valid_ratios, dim=1)
+        region_occ_ratio = torch.stack(region_occ_ratios, dim=1)
+        region_score_input = torch.cat([regions, region_valid_ratio, region_occ_ratio], dim=-1)
+        region_score = self.region_scorer(region_score_input)
+        region_score = region_score - 2.0 * region_occ_ratio
+        region_score = region_score.masked_fill(region_valid_ratio <= 0.0, -1e4)
         region_alpha = torch.softmax(region_score, dim=1)
         out = torch.sum(region_alpha * regions, dim=1)
 
@@ -1093,8 +1115,8 @@ def train_one_epoch(
 
 def parse_args():
     p = argparse.ArgumentParser(description="Occluded Face Recognition with GCN + Attention on LFW")
-    p.add_argument("--data-root", type=str, default="data/lfw-deepfunneled/lfw-deepfunneled")
-    p.add_argument("--save-dir", type=str, default="runs/occluded_gcn")
+    p.add_argument("--data-root", type=str, default=str(PROJECT_ROOT / "data" / "lfw-deepfunneled" / "lfw-deepfunneled"))
+    p.add_argument("--save-dir", type=str, default=str(PROJECT_ROOT / "runs" / "occluded_gcn_lab"))
     p.add_argument("--image-size", type=int, default=112)
     p.add_argument("--num-nodes", type=int, default=468)
     p.add_argument("--knn-k", type=int, default=6)
