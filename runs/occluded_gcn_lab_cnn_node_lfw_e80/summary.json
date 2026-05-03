@@ -1,0 +1,14 @@
+{
+  "best_val_acc": 0.7912772585669782,
+  "test_acc": 0.8306010928961749,
+  "test_macro_f1": 0.7777864074684007,
+  "num_classes": 30,
+  "train_size": 1558,
+  "val_size": 321,
+  "test_size": 366,
+  "dataset_format": "lfw_dir",
+  "cnn_branch": "node",
+  "cnn_backbone": "resnet18",
+  "cnn_dropout": 0.2,
+  "region_count": 9
+}

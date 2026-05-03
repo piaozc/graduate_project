@@ -1,0 +1,13 @@
+{
+  "best_val_acc": 0.5950155763239875,
+  "test_acc": 0.5601092896174863,
+  "test_macro_f1": 0.533441220021291,
+  "num_classes": 30,
+  "train_size": 1558,
+  "val_size": 321,
+  "test_size": 366,
+  "loss_head": "linear",
+  "arc_scale": 30.0,
+  "arc_margin": 0.3,
+  "region_count": 9
+}
