@@ -34,6 +34,8 @@ FACE_REGION_CONNECTIONS = {
     "face_oval": "FACE_LANDMARKS_FACE_OVAL",
     "left_eye": "FACE_LANDMARKS_LEFT_EYE",
     "right_eye": "FACE_LANDMARKS_RIGHT_EYE",
+    "left_iris": "FACE_LANDMARKS_LEFT_IRIS",
+    "right_iris": "FACE_LANDMARKS_RIGHT_IRIS",
     "left_eyebrow": "FACE_LANDMARKS_LEFT_EYEBROW",
     "right_eyebrow": "FACE_LANDMARKS_RIGHT_EYEBROW",
     "lips": "FACE_LANDMARKS_LIPS",
@@ -270,16 +272,18 @@ def build_region_adjacency() -> torch.Tensor:
         ("face_oval", "right_eye"),
         ("face_oval", "left_eyebrow"),
         ("face_oval", "right_eyebrow"),
-        ("face_oval", "lips"),
         ("face_oval", "nose"),
         ("left_eye", "left_eyebrow"),
         ("right_eye", "right_eyebrow"),
+        ("left_eye", "left_iris"),
+        ("right_eye", "right_iris"),
         ("left_eye", "nose"),
         ("right_eye", "nose"),
         ("left_eyebrow", "nose"),
         ("right_eyebrow", "nose"),
         ("nose", "lips"),
         ("left_eye", "right_eye"),
+        ("left_iris", "right_iris"),
         ("left_eyebrow", "right_eyebrow"),
     ]
     for left, right in edges:
@@ -914,6 +918,27 @@ class SemanticRegionAggregator(nn.Module):
         super().__init__()
         self.register_buffer("region_masks", build_semantic_region_masks(num_nodes), persistent=False)
 
+    @staticmethod
+    def _aggregate_region(
+        x: torch.Tensor,
+        mask: torch.Tensor,
+        valid_flag: torch.Tensor,
+        reliability_flag: torch.Tensor,
+        occ_flag: torch.Tensor,
+        node_weight: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        mask = mask.to(dtype=x.dtype, device=x.device)
+        masked_weight = node_weight * mask
+        denom = masked_weight.sum(dim=1, keepdim=True).clamp(min=1e-6)
+        region_feat = (masked_weight * x).sum(dim=1) / denom.squeeze(1)
+
+        region_size = mask.sum(dim=1).clamp(min=1.0)
+        valid_count = (valid_flag * mask).sum(dim=1)
+        valid_ratio = valid_count / region_size
+        reliability = (reliability_flag * valid_flag * mask).sum(dim=1) / valid_count.clamp(min=1e-6)
+        occ_ratio = (occ_flag * valid_flag * mask).sum(dim=1) / valid_count.clamp(min=1e-6)
+        return region_feat, valid_ratio, reliability, occ_ratio
+
     def forward(
         self,
         x: torch.Tensor,
@@ -927,17 +952,13 @@ class SemanticRegionAggregator(nn.Module):
         region_occ_ratios = []
 
         node_weight = valid_flag * reliability_flag * (1.0 - 0.5 * occ_flag)
+        batch_size, num_nodes, _ = x.shape
         for region_mask in self.region_masks:
-            mask = region_mask.view(1, -1, 1).to(x.device)
-            masked_weight = node_weight * mask
-            denom = masked_weight.sum(dim=1, keepdim=True).clamp(min=1e-6)
-            region_feat = (masked_weight * x).sum(dim=1) / denom.squeeze(1)
+            mask = region_mask.view(1, num_nodes, 1).expand(batch_size, -1, -1)
+            region_feat, valid_ratio, reliability, occ_ratio = self._aggregate_region(
+                x, mask, valid_flag, reliability_flag, occ_flag, node_weight
+            )
             region_features.append(region_feat)
-
-            region_size = mask.sum(dim=1).clamp(min=1.0)
-            valid_ratio = (valid_flag * mask).sum(dim=1) / region_size
-            reliability = (reliability_flag * valid_flag * mask).sum(dim=1) / (valid_flag * mask).sum(dim=1).clamp(min=1e-6)
-            occ_ratio = (occ_flag * valid_flag * mask).sum(dim=1) / (valid_flag * mask).sum(dim=1).clamp(min=1e-6)
             region_valid_ratios.append(valid_ratio)
             region_reliabilities.append(reliability)
             region_occ_ratios.append(occ_ratio)
@@ -978,6 +999,26 @@ class RegionGraphAttentionPool(nn.Module):
         return out
 
 
+class ArcMarginProduct(nn.Module):
+    def __init__(self, in_dim: int, num_classes: int, scale: float = 30.0, margin: float = 0.3):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(num_classes, in_dim))
+        nn.init.xavier_uniform_(self.weight)
+        self.scale = scale
+        self.margin = margin
+
+    def forward(self, embeddings: torch.Tensor, labels: torch.Tensor | None = None) -> torch.Tensor:
+        cosine = F.linear(F.normalize(embeddings, p=2, dim=1), F.normalize(self.weight, p=2, dim=1))
+        if labels is None or self.margin <= 0:
+            return cosine * self.scale
+
+        theta = torch.acos(cosine.clamp(-1.0 + 1e-7, 1.0 - 1e-7))
+        target_logits = torch.cos(theta + self.margin)
+        one_hot = F.one_hot(labels, num_classes=cosine.size(1)).to(dtype=cosine.dtype, device=cosine.device)
+        logits = cosine * (1.0 - one_hot) + target_logits * one_hot
+        return logits * self.scale
+
+
 class OccludedFaceGCN(nn.Module):
     def __init__(
         self,
@@ -992,6 +1033,9 @@ class OccludedFaceGCN(nn.Module):
         use_node_attention: bool,
         message_scale_init: float,
         jk_mode: str,
+        loss_head: str,
+        arc_scale: float,
+        arc_margin: float,
     ):
         super().__init__()
         self.use_input_gate = use_input_gate
@@ -1027,7 +1071,12 @@ class OccludedFaceGCN(nn.Module):
             self.pool = RegionGraphAttentionPool(hidden_dim)
         else:
             raise ValueError(f"Unsupported pool_mode: {pool_mode}")
-        self.head = nn.Linear(hidden_dim, num_classes)
+        if loss_head == "arcface":
+            self.head = ArcMarginProduct(hidden_dim, num_classes, scale=arc_scale, margin=arc_margin)
+        elif loss_head == "linear":
+            self.head = nn.Linear(hidden_dim, num_classes)
+        else:
+            raise ValueError(f"Unsupported loss_head: {loss_head}")
         self.last_input_gate = None
         self.last_attention = None
         self.last_node_attention = None
@@ -1047,7 +1096,14 @@ class OccludedFaceGCN(nn.Module):
         adj = torch.maximum(adj, eye)
         return normalize_adjacency(adj)
 
-    def forward(self, x: torch.Tensor, adj: torch.Tensor, return_attention: bool = False, return_features: bool = False):
+    def forward(
+        self,
+        x: torch.Tensor,
+        adj: torch.Tensor,
+        labels: torch.Tensor | None = None,
+        return_attention: bool = False,
+        return_features: bool = False,
+    ):
         reliability_flag = x[:, :, RELIABILITY_INDEX:RELIABILITY_INDEX + 1]
         valid_flag = x[:, :, VALID_FLAG_INDEX:VALID_FLAG_INDEX + 1]
         occ_flag = x[:, :, OCC_FLAG_INDEX:OCC_FLAG_INDEX + 1]
@@ -1096,7 +1152,7 @@ class OccludedFaceGCN(nn.Module):
             self.last_input_gate = input_alpha
             self.last_node_attention = node_alpha
             self.last_attention = graph_alpha
-            logits = self.head(g)
+            logits = self.head(g, labels) if isinstance(self.head, ArcMarginProduct) else self.head(g)
             if return_features:
                 return logits, g, {
                     "input_gate": input_alpha,
@@ -1113,7 +1169,7 @@ class OccludedFaceGCN(nn.Module):
         self.last_input_gate = None
         self.last_attention = None
         self.last_node_attention = None
-        logits = self.head(g)
+        logits = self.head(g, labels) if isinstance(self.head, ArcMarginProduct) else self.head(g)
         if return_features:
             return logits, g
         return logits
@@ -1288,7 +1344,7 @@ def train_one_epoch(
         y = y.to(device)
 
         optimizer.zero_grad()
-        logits_clean, graph_feat_clean = model(clean_node_feat, adj, return_features=True)
+        logits_clean, graph_feat_clean = model(clean_node_feat, adj, labels=y, return_features=True)
         loss = criterion(logits_clean, y)
 
         if schedule > 0.0:
@@ -1296,7 +1352,7 @@ def train_one_epoch(
                 [torch.from_numpy(apply_random_occlusion(sample.numpy(), effective_occlusion_prob)) for sample in node_feat],
                 dim=0,
             ).to(device)
-            logits_occ, graph_feat_occ = model(occ_node_feat, adj, return_features=True)
+            logits_occ, graph_feat_occ = model(occ_node_feat, adj, labels=y, return_features=True)
             cls_loss = 0.5 * (criterion(logits_clean, y) + criterion(logits_occ, y))
             cons_loss = occlusion_consistency_loss(graph_feat_clean, graph_feat_occ)
             loss = cls_loss + effective_consistency_weight * cons_loss
@@ -1313,7 +1369,9 @@ def train_one_epoch(
         optimizer.step()
 
         running_loss += loss.item() * y.size(0)
-        running_correct += (torch.argmax(logits_clean, dim=1) == y).sum().item()
+        with torch.no_grad():
+            eval_logits = model(clean_node_feat, adj)
+        running_correct += (torch.argmax(eval_logits, dim=1) == y).sum().item()
         running_total += y.size(0)
 
     return running_loss / max(running_total, 1), running_correct / max(running_total, 1), schedule
@@ -1323,6 +1381,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="Occluded Face Recognition with GCN + Attention on LFW")
     p.add_argument("--data-root", type=str, default="data/lfw-deepfunneled/lfw-deepfunneled")
     p.add_argument("--save-dir", type=str, default="runs/occluded_gcn")
+    p.add_argument("--cache-path", type=str, default="", help="Optional shared landmark cache path. Defaults to save-dir cache.")
     p.add_argument("--image-size", type=int, default=112)
     p.add_argument("--num-nodes", type=int, default=468)
     p.add_argument("--knn-k", type=int, default=6)
@@ -1350,11 +1409,14 @@ def parse_args():
     p.add_argument("--hidden-dim", type=int, default=256)
     p.add_argument("--dropout", type=float, default=0.3)
     p.add_argument("--batch-size", type=int, default=32)
-    p.add_argument("--epochs", type=int, default=50)
+    p.add_argument("--epochs", type=int, default=80)
     p.add_argument("--warmup-epochs", type=int, default=5)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--label-smoothing", type=float, default=0.05)
+    p.add_argument("--loss-head", type=str, default="linear", choices=["linear", "arcface"])
+    p.add_argument("--arc-scale", type=float, default=30.0)
+    p.add_argument("--arc-margin", type=float, default=0.3)
     p.add_argument("--balanced-sampling", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--class-weighting", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--metric-loss", type=str, default="triplet", choices=["none", "triplet"])
@@ -1373,10 +1435,13 @@ def main():
 
     data_root = Path(args.data_root)
     save_dir = Path(args.save_dir)
-    cache_path = save_dir / (
-        f"landmark_cache_{args.num_nodes}n_feat{NODE_FEAT_DIM}_local{args.rgb_window_size}"
-        f"_{args.graph_mode}.npz"
-    )
+    if args.cache_path:
+        cache_path = Path(args.cache_path)
+    else:
+        cache_path = save_dir / (
+            f"landmark_cache_{args.num_nodes}n_feat{NODE_FEAT_DIM}_local{args.rgb_window_size}"
+            f"_{args.graph_mode}.npz"
+        )
     save_dir.mkdir(parents=True, exist_ok=True)
 
     if not data_root.exists():
@@ -1472,6 +1537,9 @@ def main():
         use_node_attention=args.use_node_attention,
         message_scale_init=args.message_scale_init,
         jk_mode=args.jk_mode,
+        loss_head=args.loss_head,
+        arc_scale=args.arc_scale,
+        arc_margin=args.arc_margin,
     ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -1489,9 +1557,10 @@ def main():
         f"| message_scale_init={args.message_scale_init} | jk={args.jk_mode}"
     )
     print(f"Class balance: weighted_loss={args.class_weighting} | balanced_sampling={args.balanced_sampling}")
+    print(f"Loss head: {args.loss_head} | arc_scale={args.arc_scale} | arc_margin={args.arc_margin}")
     print("Evaluation mode: feature matching against train-set class prototypes")
     print("Input features: landmark geometry + handcrafted local appearance descriptors + landmark reliability")
-    print("Backbone mode: landmark local encoding -> semantic region graph propagation -> reliability-aware region pooling")
+    print("Backbone mode: landmark local encoding -> fine semantic region graph propagation -> reliability-aware region pooling")
     print("Training mode: clean warmup, then region-graph occlusion optimization")
 
     for epoch in range(1, args.epochs + 1):
@@ -1554,6 +1623,10 @@ def main():
                 "train_size": len(train_ds),
                 "val_size": len(val_ds),
                 "test_size": len(test_ds),
+                "loss_head": args.loss_head,
+                "arc_scale": args.arc_scale,
+                "arc_margin": args.arc_margin,
+                "region_count": len(REGION_NAMES),
             },
             f,
             ensure_ascii=False,

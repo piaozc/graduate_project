@@ -2,9 +2,10 @@
 import json
 import os
 import random
+import struct
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 os.environ.setdefault("GLOG_minloglevel", "2")
@@ -15,17 +16,19 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchvision import models
 from mediapipe.tasks.python.vision import FaceLandmarksConnections
 from torch.utils.data import DataLoader, Dataset, Sampler, WeightedRandomSampler
 from tqdm import tqdm
 
-NODE_FEAT_DIM = 37
+NODE_FEAT_DIM = 38
 GEOMETRY_START_INDEX = 2
 GEOMETRY_END_INDEX = 13
 APPEARANCE_START_INDEX = 13
 APPEARANCE_END_INDEX = 35
-VALID_FLAG_INDEX = 35
-OCC_FLAG_INDEX = 36
+RELIABILITY_INDEX = 35
+VALID_FLAG_INDEX = 36
+OCC_FLAG_INDEX = 37
 TOPOLOGY_EDGE_WEIGHT = 1.0
 KNN_EDGE_WEIGHT = 0.35
 OCCLUDED_MESSAGE_SCALE = 0.2
@@ -33,12 +36,16 @@ FACE_REGION_CONNECTIONS = {
     "face_oval": "FACE_LANDMARKS_FACE_OVAL",
     "left_eye": "FACE_LANDMARKS_LEFT_EYE",
     "right_eye": "FACE_LANDMARKS_RIGHT_EYE",
+    "left_iris": "FACE_LANDMARKS_LEFT_IRIS",
+    "right_iris": "FACE_LANDMARKS_RIGHT_IRIS",
     "left_eyebrow": "FACE_LANDMARKS_LEFT_EYEBROW",
     "right_eyebrow": "FACE_LANDMARKS_RIGHT_EYEBROW",
     "lips": "FACE_LANDMARKS_LIPS",
     "nose": "FACE_LANDMARKS_NOSE",
 }
+REGION_NAMES = tuple(FACE_REGION_CONNECTIONS.keys())
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+MXREC_PREFIX = "mxrec://"
 
 
 def seed_everything(seed: int) -> None:
@@ -53,6 +60,62 @@ class SampleMeta:
     image_path: str
     label: int
     class_name: str
+
+
+class MXIndexedRecordReader:
+    MAGIC = 0xCED7230A
+    HEADER_SIZE = 28
+    PREFIX_SIZE = 4
+
+    def __init__(self, root: Path):
+        self.root = root
+        self.rec_path = root / "train.rec"
+        self.idx_path = root / "train.idx"
+        if not self.rec_path.exists() or not self.idx_path.exists():
+            raise FileNotFoundError(f"MXNet RecordIO files not found under: {root}")
+
+        self.offsets: Dict[int, int] = {}
+        with open(self.idx_path, "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) >= 2:
+                    self.offsets[int(parts[0])] = int(parts[1])
+        self.sorted_keys = sorted(self.offsets)
+        self.next_offsets: Dict[int, int] = {}
+        rec_size = self.rec_path.stat().st_size
+        for i, key in enumerate(self.sorted_keys):
+            self.next_offsets[key] = self.offsets[self.sorted_keys[i + 1]] if i + 1 < len(self.sorted_keys) else rec_size
+        self._fh = None
+
+    def _file(self):
+        if self._fh is None:
+            self._fh = open(self.rec_path, "rb")
+        return self._fh
+
+    def read_image(self, record_key: int) -> Optional[np.ndarray]:
+        offset = self.offsets.get(record_key)
+        if offset is None:
+            return None
+
+        fh = self._file()
+        fh.seek(offset)
+        magic_raw = fh.read(self.PREFIX_SIZE)
+        if len(magic_raw) != self.PREFIX_SIZE:
+            return None
+        magic = struct.unpack("<I", magic_raw)[0]
+        if magic != self.MAGIC:
+            return None
+
+        header = fh.read(self.HEADER_SIZE)
+        if len(header) != self.HEADER_SIZE:
+            return None
+
+        data_len = self.next_offsets[record_key] - offset - self.PREFIX_SIZE - self.HEADER_SIZE
+        if data_len <= 0:
+            return None
+        data = fh.read(data_len)
+        img_arr = np.frombuffer(data, dtype=np.uint8)
+        return cv2.imdecode(img_arr, cv2.IMREAD_COLOR)
 
 
 def scan_lfw(root: Path, min_images_per_identity: int, max_classes: int, max_images_per_class: int) -> Tuple[List[SampleMeta], Dict[str, int]]:
@@ -77,6 +140,37 @@ def scan_lfw(root: Path, min_images_per_identity: int, max_classes: int, max_ima
             imgs = imgs[:max_images_per_class]
         for p in imgs:
             samples.append(SampleMeta(str(p), class_to_idx[class_name], class_name))
+
+    return samples, class_to_idx
+
+
+def scan_mxrec(root: Path, min_images_per_identity: int, max_classes: int, max_images_per_class: int) -> Tuple[List[SampleMeta], Dict[str, int]]:
+    lst_path = root / "train.lst"
+    if not lst_path.exists():
+        raise FileNotFoundError(f"MXNet RecordIO list file not found: {lst_path}")
+
+    by_class: Dict[str, List[int]] = {}
+    with open(lst_path, "r", encoding="utf-8") as f:
+        for record_key, line in enumerate(f, start=1):
+            parts = line.strip().split()
+            if not parts:
+                continue
+            class_name = parts[2] if len(parts) >= 3 else Path(parts[1].replace("\\", "/")).parent.name
+            by_class.setdefault(class_name, []).append(record_key)
+
+    selected = [(name, keys) for name, keys in by_class.items() if len(keys) >= min_images_per_identity]
+    selected.sort(key=lambda x: len(x[1]), reverse=True)
+    if max_classes > 0:
+        selected = selected[:max_classes]
+
+    class_to_idx = {name: i for i, (name, _) in enumerate(selected)}
+    samples: List[SampleMeta] = []
+    for class_name, keys in selected:
+        if max_images_per_class > 0:
+            keys = keys[:max_images_per_class]
+        label = class_to_idx[class_name]
+        for key in keys:
+            samples.append(SampleMeta(f"{MXREC_PREFIX}{key}", label, class_name))
 
     return samples, class_to_idx
 
@@ -249,10 +343,66 @@ def build_region_masks(num_nodes: int) -> torch.Tensor:
     return torch.stack(masks, dim=0)
 
 
+def build_semantic_region_masks(num_nodes: int) -> torch.Tensor:
+    masks = []
+    for connection_name in FACE_REGION_CONNECTIONS.values():
+        nodes = sorted({idx for edge in _connections_to_edges(connection_name, num_nodes) for idx in edge})
+        mask = torch.zeros(num_nodes, dtype=torch.bool)
+        if nodes:
+            mask[nodes] = True
+        masks.append(mask)
+    return torch.stack(masks, dim=0)
+
+
+def build_region_adjacency() -> torch.Tensor:
+    region_count = len(REGION_NAMES)
+    adj = torch.zeros(region_count, region_count, dtype=torch.float32)
+    region_to_idx = {name: idx for idx, name in enumerate(REGION_NAMES)}
+    edges = [
+        ("face_oval", "left_eye"),
+        ("face_oval", "right_eye"),
+        ("face_oval", "left_eyebrow"),
+        ("face_oval", "right_eyebrow"),
+        ("face_oval", "nose"),
+        ("left_eye", "left_eyebrow"),
+        ("right_eye", "right_eyebrow"),
+        ("left_eye", "left_iris"),
+        ("right_eye", "right_iris"),
+        ("left_eye", "nose"),
+        ("right_eye", "nose"),
+        ("left_eyebrow", "nose"),
+        ("right_eyebrow", "nose"),
+        ("nose", "lips"),
+        ("left_eye", "right_eye"),
+        ("left_iris", "right_iris"),
+        ("left_eyebrow", "right_eyebrow"),
+    ]
+    for left, right in edges:
+        u = region_to_idx[left]
+        v = region_to_idx[right]
+        adj[u, v] = 1.0
+        adj[v, u] = 1.0
+    adj.fill_diagonal_(1.0)
+    return adj
+
+
+def build_topology_neighbors(num_nodes: int) -> List[List[int]]:
+    neighbors = [set() for _ in range(num_nodes)]
+    for u, v in _connections_to_edges("FACE_LANDMARKS_TESSELATION", num_nodes):
+        neighbors[u].add(v)
+        neighbors[v].add(u)
+    return [sorted(arr) for arr in neighbors]
+
+
 def normalize_masked_adjacency(adj: torch.Tensor, node_feat: torch.Tensor) -> torch.Tensor:
     valid = node_feat[:, :, VALID_FLAG_INDEX:VALID_FLAG_INDEX + 1]
+    reliability = node_feat[:, :, RELIABILITY_INDEX:RELIABILITY_INDEX + 1]
     occ = node_feat[:, :, OCC_FLAG_INDEX:OCC_FLAG_INDEX + 1]
-    source_reliability = valid.transpose(1, 2) * (1.0 - occ.transpose(1, 2) * (1.0 - OCCLUDED_MESSAGE_SCALE))
+    source_reliability = (
+        valid.transpose(1, 2)
+        * reliability.transpose(1, 2)
+        * (1.0 - occ.transpose(1, 2) * (1.0 - OCCLUDED_MESSAGE_SCALE))
+    )
     target_valid = valid
     masked_adj = adj * source_reliability * target_valid
 
@@ -280,6 +430,23 @@ def local_binary_pattern_stats(image_gray: np.ndarray, x: int, y: int) -> Tuple[
 
     transitions = sum(1 for i in range(len(bits)) if bits[i] != bits[(i + 1) % len(bits)])
     return float(np.mean(bits)), float(transitions / len(bits))
+
+
+def normalize_feature_array(values: np.ndarray, valid: np.ndarray, invert: bool = False) -> np.ndarray:
+    out = np.zeros_like(values, dtype=np.float32)
+    valid_values = values[valid]
+    if valid_values.size == 0:
+        return out
+
+    lo = float(np.percentile(valid_values, 10))
+    hi = float(np.percentile(valid_values, 90))
+    if hi - lo < 1e-6:
+        out[valid] = 1.0
+    else:
+        out[valid] = np.clip((values[valid] - lo) / (hi - lo), 0.0, 1.0)
+    if invert:
+        out[valid] = 1.0 - out[valid]
+    return out
 
 
 def make_node_features(image_bgr: np.ndarray, coords_xy: np.ndarray, rgb_window_size: int) -> np.ndarray:
@@ -311,6 +478,10 @@ def make_node_features(image_bgr: np.ndarray, coords_xy: np.ndarray, rgb_window_
     half_window = max(1, rgb_window_size // 2)
     global_rgb_mean = np.mean(image_rgb, axis=(0, 1))
     global_gray_mean = float(np.mean(image_gray))
+    mean_grad_arr = np.zeros(n, dtype=np.float32)
+    std_gray_arr = np.zeros(n, dtype=np.float32)
+    entropy_arr = np.zeros(n, dtype=np.float32)
+    border_arr = np.zeros(n, dtype=np.float32)
 
     for i in range(n):
         if not valid[i]:
@@ -347,11 +518,14 @@ def make_node_features(image_bgr: np.ndarray, coords_xy: np.ndarray, rgb_window_
         std_rgb = np.std(patch_rgb, axis=(0, 1))
         mean_gray = float(np.mean(patch_gray))
         std_gray = float(np.std(patch_gray))
+        mean_grad = float(np.mean(patch_grad))
+        entropy = patch_entropy(patch_gray)
+        border_margin = min(x_norm[i], 1.0 - x_norm[i], y_norm[i], 1.0 - y_norm[i])
         feat[i, 13:16] = mean_rgb
         feat[i, 16:19] = std_rgb
         feat[i, 19] = mean_gray
         feat[i, 20] = std_gray
-        feat[i, 21] = float(np.mean(patch_grad))
+        feat[i, 21] = mean_grad
         feat[i, 22] = float(np.std(patch_grad))
         feat[i, 23] = float(np.mean(np.abs(patch_gray - center_gray)))
         feat[i, 24] = center_gray
@@ -362,9 +536,48 @@ def make_node_features(image_bgr: np.ndarray, coords_xy: np.ndarray, rgb_window_
         feat[i, 31] = lbp_transition
         feat[i, 32] = float(np.mean(np.abs(grad_x[y0:y1, x0:x1])))
         feat[i, 33] = float(np.mean(np.abs(grad_y[y0:y1, x0:x1])))
-        feat[i, 34] = patch_entropy(patch_gray)
-        feat[i, VALID_FLAG_INDEX] = 1.0
+        feat[i, 34] = entropy
+        mean_grad_arr[i] = mean_grad
+        std_gray_arr[i] = std_gray
+        entropy_arr[i] = entropy
+        border_arr[i] = np.clip(border_margin / 0.15, 0.0, 1.0)
         feat[i, OCC_FLAG_INDEX] = 0.0
+
+    density_residual = np.full(n, 1e6, dtype=np.float32)
+    topology_residual = np.full(n, 1e6, dtype=np.float32)
+    valid_idx = np.where(valid)[0]
+    if len(valid_idx) > 1:
+        valid_coords = np.stack([x_norm[valid], y_norm[valid]], axis=1)
+        dist = np.sqrt(np.sum((valid_coords[:, None, :] - valid_coords[None, :, :]) ** 2, axis=2))
+        for i, node_idx in enumerate(valid_idx):
+            nn = np.sort(dist[i])[1 : min(4, len(valid_idx))]
+            if nn.size > 0:
+                density_residual[node_idx] = float(np.mean(nn) / face_scale)
+
+    topology_neighbors = build_topology_neighbors(n)
+    for i in valid_idx:
+        neigh = [j for j in topology_neighbors[i] if valid[j]]
+        if not neigh:
+            continue
+        neigh_coords = np.stack([x_norm[neigh], y_norm[neigh]], axis=1)
+        center = np.array([x_norm[i], y_norm[i]], dtype=np.float32)
+        topology_residual[i] = float(np.mean(np.sqrt(np.sum((neigh_coords - center) ** 2, axis=1))) / face_scale)
+
+    grad_score = normalize_feature_array(mean_grad_arr, valid)
+    texture_score = 0.5 * normalize_feature_array(std_gray_arr, valid) + 0.5 * normalize_feature_array(entropy_arr, valid)
+    density_score = normalize_feature_array(density_residual, valid, invert=True)
+    topology_score = normalize_feature_array(topology_residual, valid, invert=True)
+    reliability = np.zeros(n, dtype=np.float32)
+    reliability[valid] = (
+        0.35 * topology_score[valid]
+        + 0.25 * density_score[valid]
+        + 0.20 * grad_score[valid]
+        + 0.10 * texture_score[valid]
+        + 0.10 * border_arr[valid]
+    )
+    reliability[valid] = np.clip(reliability[valid], 0.05, 1.0)
+    feat[:, RELIABILITY_INDEX] = reliability
+    feat[valid, VALID_FLAG_INDEX] = 1.0
 
     return feat
 
@@ -417,6 +630,7 @@ def apply_random_occlusion(node_feat: np.ndarray, occlusion_prob: float) -> np.n
     # regions while keeping absolute node positions for graph propagation.
     out[inside, GEOMETRY_START_INDEX:GEOMETRY_END_INDEX] = 0.0
     out[inside, APPEARANCE_START_INDEX:APPEARANCE_END_INDEX] = 0.0
+    out[inside, RELIABILITY_INDEX] *= 0.25
     out[inside, OCC_FLAG_INDEX] = 1.0
     return out
 
@@ -433,6 +647,8 @@ class LFWOccludedGraphDataset(Dataset):
         cache_path: Path,
         train_mode: bool,
         occlusion_prob: float,
+        record_root: Optional[Path] = None,
+        return_image: bool = False,
     ) -> None:
         self.samples = list(samples)
         self.image_size = image_size
@@ -442,8 +658,10 @@ class LFWOccludedGraphDataset(Dataset):
         self.rgb_window_size = rgb_window_size
         self.train_mode = train_mode
         self.occlusion_prob = occlusion_prob
+        self.return_image = return_image
         self.cache_path = cache_path
         self.extractor = LandmarkExtractor(num_nodes=num_nodes)
+        self.record_reader = MXIndexedRecordReader(record_root) if record_root is not None else None
         self.invalid_paths = set()
 
         self.cache: Dict[str, Dict[str, np.ndarray]] = {}
@@ -468,7 +686,7 @@ class LFWOccludedGraphDataset(Dataset):
                 valid_samples.append(s)
                 continue
 
-            img = cv2.imread(s.image_path)
+            img = self._read_image(s)
             if img is None:
                 self.invalid_paths.add(key)
                 continue
@@ -492,6 +710,14 @@ class LFWOccludedGraphDataset(Dataset):
 
         self.samples = valid_samples
 
+    def _read_image(self, sample: SampleMeta) -> Optional[np.ndarray]:
+        if sample.image_path.startswith(MXREC_PREFIX):
+            if self.record_reader is None:
+                return None
+            record_key = int(sample.image_path[len(MXREC_PREFIX):])
+            return self.record_reader.read_image(record_key)
+        return cv2.imread(sample.image_path)
+
     def __len__(self) -> int:
         return len(self.samples)
 
@@ -504,9 +730,25 @@ class LFWOccludedGraphDataset(Dataset):
             node_feat = entry["node_feat"].copy()
             adj = entry["adj"].copy()
 
+        if not self.return_image:
+            return (
+                torch.from_numpy(node_feat),
+                torch.from_numpy(adj),
+                torch.tensor(s.label, dtype=torch.long),
+            )
+
+        img = self._read_image(s)
+        if img is None:
+            image_tensor = torch.zeros(3, self.image_size, self.image_size, dtype=torch.float32)
+        else:
+            img = cv2.resize(img, (self.image_size, self.image_size))
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+            image_tensor = torch.from_numpy(np.transpose(img, (2, 0, 1))).float()
+
         return (
             torch.from_numpy(node_feat),
             torch.from_numpy(adj),
+            image_tensor,
             torch.tensor(s.label, dtype=torch.long),
         )
 
@@ -687,12 +929,12 @@ class RegionAttentionPool(nn.Module):
     def __init__(self, in_dim: int, num_nodes: int, hidden: int = 64):
         super().__init__()
         self.node_scorer = nn.Sequential(
-            nn.Linear(in_dim + 2, hidden),
+            nn.Linear(in_dim, hidden),
             nn.ReLU(inplace=True),
             nn.Linear(hidden, 1),
         )
         self.region_scorer = nn.Sequential(
-            nn.Linear(in_dim + 2, hidden),
+            nn.Linear(in_dim, hidden),
             nn.ReLU(inplace=True),
             nn.Linear(hidden, 1),
         )
@@ -702,48 +944,30 @@ class RegionAttentionPool(nn.Module):
         self,
         x: torch.Tensor,
         valid_flag: torch.Tensor | None = None,
+        reliability_flag: torch.Tensor | None = None,
         occ_flag: torch.Tensor | None = None,
         return_attention: bool = False,
     ):
-        if valid_flag is None:
-            valid_flag = torch.ones_like(x[:, :, :1])
-        if occ_flag is None:
-            occ_flag = torch.zeros_like(x[:, :, :1])
-
-        node_score_input = torch.cat([x, valid_flag, occ_flag], dim=-1)
-        score = self.node_scorer(node_score_input)
-        score = score.masked_fill(valid_flag <= 0.5, -1e4)
-        score = score - 2.5 * occ_flag
+        score = self.node_scorer(x)
+        if valid_flag is not None:
+            score = score.masked_fill(valid_flag <= 0.5, -1e4)
+        if reliability_flag is not None:
+            score = score + torch.log(reliability_flag.clamp(min=1e-4))
+        if occ_flag is not None:
+            score = score - 2.0 * occ_flag
         region_features = []
         region_node_alphas = []
-        region_valid_ratios = []
-        region_occ_ratios = []
 
         for region_mask in self.region_masks:
             mask = region_mask.view(1, -1, 1)
-            region_valid = mask & (valid_flag > 0.5)
-            masked_score = score.masked_fill(~region_valid, -1e4)
+            masked_score = score.masked_fill(~mask, -1e4)
             alpha = torch.softmax(masked_score, dim=1)
-            alpha = torch.where(region_valid, alpha, torch.zeros_like(alpha))
-            alpha = alpha / alpha.sum(dim=1, keepdim=True).clamp(min=1e-6)
             region_feat = torch.sum(alpha * x, dim=1)
             region_features.append(region_feat)
             region_node_alphas.append(alpha)
 
-            valid_count = region_valid.float().sum(dim=1).clamp(min=1.0)
-            region_size = mask.float().sum(dim=1).clamp(min=1.0)
-            region_valid_ratio = valid_count / region_size
-            region_occ_ratio = (occ_flag * region_valid.float()).sum(dim=1) / valid_count
-            region_valid_ratios.append(region_valid_ratio)
-            region_occ_ratios.append(region_occ_ratio)
-
         regions = torch.stack(region_features, dim=1)
-        region_valid_ratio = torch.stack(region_valid_ratios, dim=1)
-        region_occ_ratio = torch.stack(region_occ_ratios, dim=1)
-        region_score_input = torch.cat([regions, region_valid_ratio, region_occ_ratio], dim=-1)
-        region_score = self.region_scorer(region_score_input)
-        region_score = region_score - 2.0 * region_occ_ratio
-        region_score = region_score.masked_fill(region_valid_ratio <= 0.0, -1e4)
+        region_score = self.region_scorer(regions)
         region_alpha = torch.softmax(region_score, dim=1)
         out = torch.sum(region_alpha * regions, dim=1)
 
@@ -760,10 +984,11 @@ class MeanPool(nn.Module):
         self,
         x: torch.Tensor,
         valid_flag: torch.Tensor | None = None,
+        reliability_flag: torch.Tensor | None = None,
         occ_flag: torch.Tensor | None = None,
         return_attention: bool = False,
     ):
-        _ = valid_flag, occ_flag
+        _ = valid_flag, reliability_flag, occ_flag
         out = torch.mean(x, dim=1)
         if return_attention:
             alpha = torch.full(
@@ -789,12 +1014,15 @@ class NodeAttentionPool(nn.Module):
         self,
         x: torch.Tensor,
         valid_flag: torch.Tensor | None = None,
+        reliability_flag: torch.Tensor | None = None,
         occ_flag: torch.Tensor | None = None,
         return_attention: bool = False,
     ):
         score = self.scorer(x)
         if valid_flag is not None:
             score = score.masked_fill(valid_flag <= 0.5, -1e4)
+        if reliability_flag is not None:
+            score = score + torch.log(reliability_flag.clamp(min=1e-4))
         if occ_flag is not None:
             score = score - 2.0 * occ_flag
         alpha = torch.softmax(score, dim=1)
@@ -802,6 +1030,106 @@ class NodeAttentionPool(nn.Module):
         if return_attention:
             return out, alpha
         return out
+
+
+class SemanticRegionAggregator(nn.Module):
+    def __init__(self, num_nodes: int):
+        super().__init__()
+        self.register_buffer("region_masks", build_semantic_region_masks(num_nodes), persistent=False)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        valid_flag: torch.Tensor,
+        reliability_flag: torch.Tensor,
+        occ_flag: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        region_features = []
+        region_valid_ratios = []
+        region_reliabilities = []
+        region_occ_ratios = []
+
+        node_weight = valid_flag * reliability_flag * (1.0 - 0.5 * occ_flag)
+        for region_mask in self.region_masks:
+            mask = region_mask.view(1, -1, 1).to(x.device)
+            masked_weight = node_weight * mask
+            denom = masked_weight.sum(dim=1, keepdim=True).clamp(min=1e-6)
+            region_feat = (masked_weight * x).sum(dim=1) / denom.squeeze(1)
+            region_features.append(region_feat)
+
+            region_size = mask.sum(dim=1).clamp(min=1.0)
+            valid_ratio = (valid_flag * mask).sum(dim=1) / region_size
+            reliability = (reliability_flag * valid_flag * mask).sum(dim=1) / (valid_flag * mask).sum(dim=1).clamp(min=1e-6)
+            occ_ratio = (occ_flag * valid_flag * mask).sum(dim=1) / (valid_flag * mask).sum(dim=1).clamp(min=1e-6)
+            region_valid_ratios.append(valid_ratio)
+            region_reliabilities.append(reliability)
+            region_occ_ratios.append(occ_ratio)
+
+        region_x = torch.stack(region_features, dim=1)
+        region_valid = torch.stack(region_valid_ratios, dim=1)
+        region_reliability = torch.stack(region_reliabilities, dim=1)
+        region_occ = torch.stack(region_occ_ratios, dim=1)
+        return region_x, region_valid, region_reliability, region_occ
+
+
+class RegionGraphAttentionPool(nn.Module):
+    def __init__(self, in_dim: int, hidden: int = 64):
+        super().__init__()
+        self.scorer = nn.Sequential(
+            nn.Linear(in_dim + 3, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, 1),
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        valid_flag: torch.Tensor,
+        reliability_flag: torch.Tensor,
+        occ_flag: torch.Tensor,
+        return_attention: bool = False,
+    ):
+        score_input = torch.cat([x, valid_flag, reliability_flag, occ_flag], dim=-1)
+        score = self.scorer(score_input)
+        score = score.masked_fill(valid_flag <= 0.0, -1e4)
+        score = score + torch.log(reliability_flag.clamp(min=1e-4))
+        score = score - 2.5 * occ_flag
+        alpha = torch.softmax(score, dim=1)
+        out = torch.sum(alpha * x, dim=1)
+        if return_attention:
+            return out, alpha
+        return out
+
+
+class LandmarkCNNFeatureEncoder(nn.Module):
+    def __init__(self, out_dim: int, dropout: float, backbone: str):
+        super().__init__()
+        if backbone != "resnet18":
+            raise ValueError(f"Unsupported CNN backbone: {backbone}")
+        base = models.resnet18(weights=None)
+        self.features = nn.Sequential(
+            base.conv1,
+            base.bn1,
+            base.relu,
+            base.maxpool,
+            base.layer1,
+            base.layer2,
+            base.layer3,
+        )
+        self.proj = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(256, out_dim),
+            nn.ReLU(inplace=True),
+            nn.LayerNorm(out_dim),
+        )
+
+    def forward(self, image: torch.Tensor, coords_xy: torch.Tensor) -> torch.Tensor:
+        feat_map = self.features(image)
+        grid = coords_xy.clamp(0.0, 1.0) * 2.0 - 1.0
+        grid = grid.view(grid.size(0), grid.size(1), 1, 2)
+        sampled = F.grid_sample(feat_map, grid, mode="bilinear", align_corners=True)
+        sampled = sampled.squeeze(-1).transpose(1, 2)
+        return self.proj(sampled)
 
 
 class OccludedFaceGCN(nn.Module):
@@ -818,13 +1146,19 @@ class OccludedFaceGCN(nn.Module):
         use_node_attention: bool,
         message_scale_init: float,
         jk_mode: str,
+        cnn_branch: str,
+        cnn_backbone: str,
+        cnn_dropout: float,
     ):
         super().__init__()
         self.use_input_gate = use_input_gate
         self.use_node_attention = use_node_attention
         self.jk_mode = jk_mode
+        self.region_count = len(REGION_NAMES)
         self.encoder = NodeEncoder(in_dim, hidden_dim)
         self.input_gate = OcclusionAwareInputGate(hidden_dim)
+        self.region_aggregator = SemanticRegionAggregator(num_nodes)
+        self.register_buffer("region_adj", build_region_adjacency(), persistent=False)
         if not conv_modes:
             raise ValueError("conv_modes must contain at least one graph layer.")
         self.conv_modes = list(conv_modes)
@@ -847,20 +1181,61 @@ class OccludedFaceGCN(nn.Module):
         elif pool_mode == "node_attention":
             self.pool = NodeAttentionPool(hidden_dim)
         elif pool_mode == "region_attention":
-            self.pool = RegionAttentionPool(hidden_dim, num_nodes)
+            self.pool = RegionGraphAttentionPool(hidden_dim)
         else:
             raise ValueError(f"Unsupported pool_mode: {pool_mode}")
+        self.cnn_branch = cnn_branch
+        if cnn_branch == "none":
+            self.cnn_encoder = None
+            self.cnn_node_gate = None
+        elif cnn_branch == "node":
+            self.cnn_encoder = LandmarkCNNFeatureEncoder(hidden_dim, dropout=cnn_dropout, backbone=cnn_backbone)
+            self.cnn_node_gate = nn.Sequential(
+                nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.Sigmoid(),
+            )
+        else:
+            raise ValueError(f"Unsupported cnn_branch: {cnn_branch}")
         self.head = nn.Linear(hidden_dim, num_classes)
         self.last_input_gate = None
         self.last_attention = None
         self.last_node_attention = None
 
-    def forward(self, x: torch.Tensor, adj: torch.Tensor, return_attention: bool = False, return_features: bool = False):
+    def build_region_graph(
+        self,
+        region_valid: torch.Tensor,
+        region_reliability: torch.Tensor,
+        region_occ: torch.Tensor,
+    ) -> torch.Tensor:
+        base_adj = self.region_adj.unsqueeze(0).to(region_valid.device)
+        source_weight = region_valid.transpose(1, 2) * region_reliability.transpose(1, 2)
+        target_weight = region_valid * region_reliability
+        occ_weight = 1.0 - 0.7 * region_occ.transpose(1, 2)
+        adj = base_adj * source_weight * target_weight * occ_weight
+        eye = torch.eye(self.region_count, dtype=adj.dtype, device=adj.device).unsqueeze(0)
+        adj = torch.maximum(adj, eye)
+        return normalize_adjacency(adj)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        adj: torch.Tensor,
+        image: torch.Tensor | None = None,
+        return_attention: bool = False,
+        return_features: bool = False,
+    ):
+        coords_xy = x[:, :, 0:2]
+        reliability_flag = x[:, :, RELIABILITY_INDEX:RELIABILITY_INDEX + 1]
         valid_flag = x[:, :, VALID_FLAG_INDEX:VALID_FLAG_INDEX + 1]
         occ_flag = x[:, :, OCC_FLAG_INDEX:OCC_FLAG_INDEX + 1]
-        adj_norm = normalize_masked_adjacency(adj, x)
 
         x = self.encoder(x)
+        if self.cnn_encoder is not None:
+            if image is None:
+                raise ValueError("CNN node branch requires image tensors from the dataset.")
+            cnn_node_feat = self.cnn_encoder(image, coords_xy)
+            cnn_gate = self.cnn_node_gate(torch.cat([x, cnn_node_feat], dim=-1))
+            x = x + cnn_gate * cnn_node_feat
         if self.use_input_gate and return_attention:
             x, input_alpha = self.input_gate(x, occ_flag, return_attention=True)
         elif self.use_input_gate:
@@ -869,24 +1244,38 @@ class OccludedFaceGCN(nn.Module):
         else:
             input_alpha = None
 
-        layer_outputs = [x]
+        region_x, region_valid, region_reliability, region_occ = self.region_aggregator(
+            x,
+            valid_flag=valid_flag,
+            reliability_flag=reliability_flag,
+            occ_flag=occ_flag,
+        )
+        region_adj_norm = self.build_region_graph(region_valid, region_reliability, region_occ)
+
+        layer_outputs = [region_x]
         for layer in self.gcn_layers:
-            layer_outputs.append(layer(layer_outputs[-1], adj_norm))
+            layer_outputs.append(layer(layer_outputs[-1], region_adj_norm))
         if self.jk_mode == "concat":
             x = self.jk_fuse(torch.cat(layer_outputs, dim=-1))
         else:
             x = layer_outputs[-1]
 
         if self.use_node_attention and return_attention:
-            x, node_alpha = self.node_attention(x, occ_flag, return_attention=True)
+            x, node_alpha = self.node_attention(x, region_occ, return_attention=True)
         elif self.use_node_attention:
-            x = self.node_attention(x, occ_flag)
+            x = self.node_attention(x, region_occ)
             node_alpha = None
         else:
             node_alpha = None
 
         if return_attention:
-            g, graph_alpha = self.pool(x, valid_flag=valid_flag, occ_flag=occ_flag, return_attention=True)
+            g, graph_alpha = self.pool(
+                x,
+                valid_flag=region_valid,
+                reliability_flag=region_reliability,
+                occ_flag=region_occ,
+                return_attention=True,
+            )
             self.last_input_gate = input_alpha
             self.last_node_attention = node_alpha
             self.last_attention = graph_alpha
@@ -896,14 +1285,14 @@ class OccludedFaceGCN(nn.Module):
                     "input_gate": input_alpha,
                     "node_attention": node_alpha,
                     "graph_attention": graph_alpha,
-                }
+            }
             return logits, {
                 "input_gate": input_alpha,
                 "node_attention": node_alpha,
                 "graph_attention": graph_alpha,
             }
 
-        g = self.pool(x, valid_flag=valid_flag, occ_flag=occ_flag)
+        g = self.pool(x, valid_flag=region_valid, reliability_flag=region_reliability, occ_flag=region_occ)
         self.last_input_gate = None
         self.last_attention = None
         self.last_node_attention = None
@@ -943,16 +1332,24 @@ def occlusion_consistency_loss(clean_feat: torch.Tensor, occ_feat: torch.Tensor)
     return F.mse_loss(clean_feat, occ_feat)
 
 
+def unpack_batch(batch, device: torch.device):
+    if len(batch) == 4:
+        node_feat, adj, image, y = batch
+        image = image.to(device)
+    else:
+        node_feat, adj, y = batch
+        image = None
+    return node_feat.to(device), adj.to(device), image, y.to(device)
+
+
 @torch.no_grad()
 def build_class_prototypes(model: nn.Module, loader: DataLoader, device: torch.device) -> Dict[int, torch.Tensor]:
     model.eval()
     by_class: Dict[int, List[torch.Tensor]] = {}
 
-    for node_feat, adj, y in loader:
-        node_feat = node_feat.to(device)
-        adj = adj.to(device)
-        y = y.to(device)
-        _, graph_feat = model(node_feat, adj, return_features=True)
+    for batch in loader:
+        node_feat, adj, image, y = unpack_batch(batch, device)
+        _, graph_feat = model(node_feat, adj, image=image, return_features=True)
         graph_feat = F.normalize(graph_feat, p=2, dim=1)
 
         for feat, label in zip(graph_feat, y):
@@ -979,11 +1376,9 @@ def evaluate(model: nn.Module, gallery_loader: DataLoader, probe_loader: DataLoa
     sorted_labels = sorted(prototypes.keys())
     proto_mat = torch.stack([prototypes[label] for label in sorted_labels], dim=0).to(device)
 
-    for node_feat, adj, y in probe_loader:
-        node_feat = node_feat.to(device)
-        adj = adj.to(device)
-        y = y.to(device)
-        _, graph_feat = model(node_feat, adj, return_features=True)
+    for batch in probe_loader:
+        node_feat, adj, image, y = unpack_batch(batch, device)
+        _, graph_feat = model(node_feat, adj, image=image, return_features=True)
         graph_feat = F.normalize(graph_feat, p=2, dim=1)
         scores = graph_feat @ proto_mat.t()
         pred_idx = torch.argmax(scores, dim=1)
@@ -1007,11 +1402,9 @@ def evaluate_classifier(model: nn.Module, loader: DataLoader, device: torch.devi
     all_pred = []
     all_true = []
 
-    for node_feat, adj, y in loader:
-        node_feat = node_feat.to(device)
-        adj = adj.to(device)
-        y = y.to(device)
-        logits = model(node_feat, adj)
+    for batch in loader:
+        node_feat, adj, image, y = unpack_batch(batch, device)
+        logits = model(node_feat, adj, image=image)
         pred = torch.argmax(logits, dim=1)
 
         total += y.size(0)
@@ -1074,23 +1467,20 @@ def train_one_epoch(
     effective_metric_weight = metric_weight * schedule
     effective_consistency_weight = consistency_weight * schedule
 
-    for node_feat, adj, y in tqdm(loader, desc="Train", leave=False):
+    for batch in tqdm(loader, desc="Train", leave=False):
+        node_feat, adj, image, y = unpack_batch(batch, device)
         clean_node_feat = node_feat.clone()
 
-        clean_node_feat = clean_node_feat.to(device)
-        adj = adj.to(device)
-        y = y.to(device)
-
         optimizer.zero_grad()
-        logits_clean, graph_feat_clean = model(clean_node_feat, adj, return_features=True)
+        logits_clean, graph_feat_clean = model(clean_node_feat, adj, image=image, return_features=True)
         loss = criterion(logits_clean, y)
 
         if schedule > 0.0:
             occ_node_feat = torch.stack(
-                [torch.from_numpy(apply_random_occlusion(sample.numpy(), effective_occlusion_prob)) for sample in node_feat],
+                [torch.from_numpy(apply_random_occlusion(sample.detach().cpu().numpy(), effective_occlusion_prob)) for sample in node_feat],
                 dim=0,
             ).to(device)
-            logits_occ, graph_feat_occ = model(occ_node_feat, adj, return_features=True)
+            logits_occ, graph_feat_occ = model(occ_node_feat, adj, image=image, return_features=True)
             cls_loss = 0.5 * (criterion(logits_clean, y) + criterion(logits_occ, y))
             cons_loss = occlusion_consistency_loss(graph_feat_clean, graph_feat_occ)
             loss = cls_loss + effective_consistency_weight * cons_loss
@@ -1107,7 +1497,7 @@ def train_one_epoch(
         optimizer.step()
 
         running_loss += loss.item() * y.size(0)
-        running_correct += (torch.argmax(logits_clean, dim=1) == y).sum().item()
+        running_correct += (torch.argmax(logits_clean.detach(), dim=1) == y).sum().item()
         running_total += y.size(0)
 
     return running_loss / max(running_total, 1), running_correct / max(running_total, 1), schedule
@@ -1116,7 +1506,9 @@ def train_one_epoch(
 def parse_args():
     p = argparse.ArgumentParser(description="Occluded Face Recognition with GCN + Attention on LFW")
     p.add_argument("--data-root", type=str, default=str(PROJECT_ROOT / "data" / "lfw-deepfunneled" / "lfw-deepfunneled"))
-    p.add_argument("--save-dir", type=str, default=str(PROJECT_ROOT / "runs" / "occluded_gcn_lab"))
+    p.add_argument("--save-dir", type=str, default=str(PROJECT_ROOT / "runs" / "occluded_gcn_lab_cnn_lfw"))
+    p.add_argument("--cache-path", type=str, default="", help="Optional shared landmark cache path. Defaults to save-dir cache.")
+    p.add_argument("--dataset-format", type=str, default="auto", choices=["auto", "lfw_dir", "mxrec"])
     p.add_argument("--image-size", type=int, default=112)
     p.add_argument("--num-nodes", type=int, default=468)
     p.add_argument("--knn-k", type=int, default=6)
@@ -1144,11 +1536,14 @@ def parse_args():
     p.add_argument("--hidden-dim", type=int, default=256)
     p.add_argument("--dropout", type=float, default=0.3)
     p.add_argument("--batch-size", type=int, default=32)
-    p.add_argument("--epochs", type=int, default=50)
+    p.add_argument("--epochs", type=int, default=80)
     p.add_argument("--warmup-epochs", type=int, default=5)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--label-smoothing", type=float, default=0.05)
+    p.add_argument("--cnn-branch", type=str, default="none", choices=["none", "node"])
+    p.add_argument("--cnn-backbone", type=str, default="resnet18", choices=["resnet18"])
+    p.add_argument("--cnn-dropout", type=float, default=0.2)
     p.add_argument("--balanced-sampling", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--class-weighting", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--metric-loss", type=str, default="triplet", choices=["none", "triplet"])
@@ -1167,21 +1562,38 @@ def main():
 
     data_root = Path(args.data_root)
     save_dir = Path(args.save_dir)
-    cache_path = save_dir / (
-        f"landmark_cache_{args.num_nodes}n_feat{NODE_FEAT_DIM}_local{args.rgb_window_size}"
-        f"_{args.graph_mode}.npz"
-    )
     save_dir.mkdir(parents=True, exist_ok=True)
 
     if not data_root.exists():
         raise FileNotFoundError(f"Data root not found: {data_root}")
 
-    samples, class_to_idx = scan_lfw(
-        root=data_root,
-        min_images_per_identity=args.min_images_per_identity,
-        max_classes=args.max_classes,
-        max_images_per_class=args.max_images_per_class,
-    )
+    dataset_format = args.dataset_format
+    if dataset_format == "auto":
+        dataset_format = "mxrec" if (data_root / "train.rec").exists() and (data_root / "train.idx").exists() else "lfw_dir"
+
+    if args.cache_path:
+        cache_path = Path(args.cache_path)
+    else:
+        cache_path = save_dir / (
+            f"landmark_cache_{dataset_format}_{args.num_nodes}n_feat{NODE_FEAT_DIM}_local{args.rgb_window_size}"
+            f"_{args.graph_mode}.npz"
+        )
+    record_root = data_root if dataset_format == "mxrec" else None
+
+    if dataset_format == "mxrec":
+        samples, class_to_idx = scan_mxrec(
+            root=data_root,
+            min_images_per_identity=args.min_images_per_identity,
+            max_classes=args.max_classes,
+            max_images_per_class=args.max_images_per_class,
+        )
+    else:
+        samples, class_to_idx = scan_lfw(
+            root=data_root,
+            min_images_per_identity=args.min_images_per_identity,
+            max_classes=args.max_classes,
+            max_images_per_class=args.max_images_per_class,
+        )
 
     if len(class_to_idx) < 2:
         raise RuntimeError("Valid classes < 2. Lower --min-images-per-identity or check dataset path.")
@@ -1195,6 +1607,7 @@ def main():
         raise ValueError(f"Unsupported conv modes: {invalid_conv_modes}. Valid modes: {sorted(valid_conv_modes)}")
 
     train_s, val_s, test_s = split_by_identity(samples, args.train_ratio, args.val_ratio, args.seed)
+    return_image = args.cnn_branch != "none"
 
     train_ds = LFWOccludedGraphDataset(
         samples=train_s,
@@ -1206,6 +1619,8 @@ def main():
         cache_path=cache_path,
         train_mode=True,
         occlusion_prob=args.occlusion_prob,
+        record_root=record_root,
+        return_image=return_image,
     )
     train_eval_ds = LFWOccludedGraphDataset(
         samples=train_s,
@@ -1217,6 +1632,8 @@ def main():
         cache_path=cache_path,
         train_mode=False,
         occlusion_prob=0.0,
+        record_root=record_root,
+        return_image=return_image,
     )
     val_ds = LFWOccludedGraphDataset(
         samples=val_s,
@@ -1228,6 +1645,8 @@ def main():
         cache_path=cache_path,
         train_mode=False,
         occlusion_prob=0.0,
+        record_root=record_root,
+        return_image=return_image,
     )
     test_ds = LFWOccludedGraphDataset(
         samples=test_s,
@@ -1239,6 +1658,8 @@ def main():
         cache_path=cache_path,
         train_mode=False,
         occlusion_prob=0.0,
+        record_root=record_root,
+        return_image=return_image,
     )
 
     if args.metric_loss != "none":
@@ -1266,6 +1687,9 @@ def main():
         use_node_attention=args.use_node_attention,
         message_scale_init=args.message_scale_init,
         jk_mode=args.jk_mode,
+        cnn_branch=args.cnn_branch,
+        cnn_backbone=args.cnn_backbone,
+        cnn_dropout=args.cnn_dropout,
     ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -1276,6 +1700,7 @@ def main():
     history = []
 
     print(f"Device: {device}")
+    print(f"Dataset: {dataset_format} | root={data_root}")
     print(f"Classes: {len(class_to_idx)} | Train/Val/Test: {len(train_ds)}/{len(val_ds)}/{len(test_ds)}")
     print(
         f"Ablation config: graph={args.graph_mode} | conv_layers={','.join(conv_modes)} | pool={args.pool_mode} "
@@ -1283,10 +1708,11 @@ def main():
         f"| message_scale_init={args.message_scale_init} | jk={args.jk_mode}"
     )
     print(f"Class balance: weighted_loss={args.class_weighting} | balanced_sampling={args.balanced_sampling}")
+    print(f"CNN branch: {args.cnn_branch} | cnn_backbone={args.cnn_backbone} | cnn_dropout={args.cnn_dropout}")
     print("Evaluation mode: feature matching against train-set class prototypes")
-    print("Input features: landmark geometry + handcrafted local appearance descriptors; no CNN branch")
-    print("Graph mode: MediaPipe topology + light KNN edges with occlusion-aware message passing")
-    print("Training mode: clean warmup, then masked graph attention + region attention with occlusion optimization")
+    print("Input features: landmark geometry + handcrafted local appearance descriptors + landmark reliability")
+    print("Backbone mode: landmark local encoding -> semantic region graph propagation -> reliability-aware region pooling")
+    print("Training mode: clean warmup, then region-graph occlusion optimization")
 
     for epoch in range(1, args.epochs + 1):
         train_loss, train_acc, occ_schedule = train_one_epoch(
@@ -1348,6 +1774,11 @@ def main():
                 "train_size": len(train_ds),
                 "val_size": len(val_ds),
                 "test_size": len(test_ds),
+                "dataset_format": dataset_format,
+                "cnn_branch": args.cnn_branch,
+                "cnn_backbone": args.cnn_backbone,
+                "cnn_dropout": args.cnn_dropout,
+                "region_count": len(REGION_NAMES),
             },
             f,
             ensure_ascii=False,
